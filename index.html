@@ -1891,140 +1891,107 @@
     try { g.device?.destroy(); } catch {}
   }
 
-  function disableHDR() {
-    hdrGeneration++;
+function disableHDR() {
+  hdrGeneration++;
 
-    const old = gpu;
-    gpu = null;
-    hdrStarting = false;
+  const old = gpu;
+  gpu = null;
+  hdrStarting = false;
 
-    hdrCanvas.hidden = true;
-    destroyGPU(old);
+  hdrCanvas.hidden = true;
+  destroyGPU(old);
 
-    updateHDRButton();
-    clearNextFrame = true;
+  // Restore the main application's original full-DPR canvas.
+  resize();
+
+  updateHDRButton();
+  clearNextFrame = true;
+}
+
+const shaderCode = `
+  struct Parameters {
+    texel: vec2<f32>,
+    intensity: f32,
+    beat: f32,
+  };
+
+  @group(0) @binding(0)
+  var scene: texture_2d<f32>;
+
+  @group(0) @binding(1)
+  var sceneSampler: sampler;
+
+  @group(0) @binding(2)
+  var<uniform> params: Parameters;
+
+  struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+  };
+
+  @vertex
+  fn vertexMain(
+    @builtin(vertex_index) index: u32
+  ) -> VertexOutput {
+    var positions = array<vec2<f32>, 3>(
+      vec2<f32>(-1.0, -1.0),
+      vec2<f32>( 3.0, -1.0),
+      vec2<f32>(-1.0,  3.0)
+    );
+
+    let p = positions[index];
+
+    var output: VertexOutput;
+    output.position = vec4<f32>(p, 0.0, 1.0);
+    output.uv = vec2<f32>(
+      p.x * 0.5 + 0.5,
+      0.5 - p.y * 0.5
+    );
+
+    return output;
   }
 
-  // A real floating-point HDR output, not a CSS brightness filter.
-  const shaderCode = `
-    struct Parameters {
-      texel: vec2<f32>,
-      intensity: f32,
-      beat: f32,
-    };
+  fn toLinear(c: vec3<f32>) -> vec3<f32> {
+    return select(
+      pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)),
+      c / 12.92,
+      c <= vec3<f32>(0.04045)
+    );
+  }
 
-    @group(0) @binding(0)
-    var scene: texture_2d<f32>;
+  fn toEncoded(c: vec3<f32>) -> vec3<f32> {
+    let safe = max(c, vec3<f32>(0.0));
 
-    @group(0) @binding(1)
-    var sceneSampler: sampler;
+    return select(
+      1.055 * pow(safe, vec3<f32>(1.0 / 2.4)) - 0.055,
+      safe * 12.92,
+      safe <= vec3<f32>(0.0031308)
+    );
+  }
 
-    @group(0) @binding(2)
-    var<uniform> params: Parameters;
+  @fragment
+  fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+    // One texture lookup. Reuse the glow already drawn by Canvas 2D.
+    let encoded = textureSample(scene, sceneSampler, input.uv).rgb;
+    let base = toLinear(encoded);
 
-    struct VertexOutput {
-      @builtin(position) position: vec4<f32>,
-      @location(0) uv: vec2<f32>,
-    };
+    let peak = max(max(base.r, base.g), base.b);
+    let highlight = smoothstep(0.35, 0.95, peak);
 
-    @vertex
-    fn vertexMain(
-      @builtin(vertex_index) index: u32
-    ) -> VertexOutput {
-      var positions = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 3.0, -1.0),
-        vec2<f32>(-1.0,  3.0)
-      );
+    let luma = dot(base, vec3<f32>(0.229, 0.692, 0.079));
 
-      let p = positions[index];
+    let colorful = max(
+      mix(vec3<f32>(luma), base, 1.0 + highlight * 0.10),
+      vec3<f32>(0.0)
+    );
 
-      var output: VertexOutput;
-      output.position = vec4<f32>(p, 0.0, 1.0);
-      output.uv = vec2<f32>(
-        p.x * 0.5 + 0.5,
-        0.5 - p.y * 0.5
-      );
+    let gain = 1.0
+      + highlight * (params.intensity + params.beat * 0.22);
 
-      return output;
-    }
-
-    // Display P3 and sRGB use the same transfer-function shape.
-    // Work in linear light for highlight and bloom calculations.
-    fn toLinear(c: vec3<f32>) -> vec3<f32> {
-      return select(
-        pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)),
-        c / 12.92,
-        c <= vec3<f32>(0.04045)
-      );
-    }
-
-    fn toEncoded(c: vec3<f32>) -> vec3<f32> {
-      let safe = max(c, vec3<f32>(0.0));
-
-      return select(
-        1.055 * pow(safe, vec3<f32>(1.0 / 2.4)) - 0.055,
-        safe * 12.92,
-        safe <= vec3<f32>(0.0031308)
-      );
-    }
-
-    fn readScene(uv: vec2<f32>) -> vec3<f32> {
-      return toLinear(textureSample(scene, sceneSampler, uv).rgb);
-    }
-
-    fn brightPart(c: vec3<f32>) -> vec3<f32> {
-      let peak = max(max(c.r, c.g), c.b);
-      return c * smoothstep(0.35, 0.9, peak);
-    }
-
-    @fragment
-    fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
-      let uv = input.uv;
-      let base = readScene(uv);
-
-      let peak = max(max(base.r, base.g), base.b);
-      let highlight = smoothstep(0.35, 0.95, peak);
-
-      // Small cross-shaped bloom kernel.
-      // The original Canvas 2D glow provides the wider soft halo.
-      let near = params.texel * 4.0;
-      let far = params.texel * 11.0;
-
-      var bloom = vec3<f32>(0.0);
-
-      bloom += brightPart(readScene(uv + vec2<f32>( near.x, 0.0)));
-      bloom += brightPart(readScene(uv + vec2<f32>(-near.x, 0.0)));
-      bloom += brightPart(readScene(uv + vec2<f32>(0.0,  near.y)));
-      bloom += brightPart(readScene(uv + vec2<f32>(0.0, -near.y)));
-
-      bloom += 0.5 * brightPart(readScene(uv + vec2<f32>( far.x, 0.0)));
-      bloom += 0.5 * brightPart(readScene(uv + vec2<f32>(-far.x, 0.0)));
-      bloom += 0.5 * brightPart(readScene(uv + vec2<f32>(0.0,  far.y)));
-      bloom += 0.5 * brightPart(readScene(uv + vec2<f32>(0.0, -far.y)));
-
-      bloom /= 6.0;
-
-      // A small artistic saturation expansion in the P3 output space.
-      // Only luminous areas are changed; the background is preserved.
-      let luma = dot(base, vec3<f32>(0.229, 0.692, 0.079));
-
-      let colorful = max(
-        mix(vec3<f32>(luma), base, 1.0 + highlight * 0.10),
-        vec3<f32>(0.0)
-      );
-
-      // Keep brightness modulation subtle and localized to highlights.
-      let gain = 1.0
-        + highlight * (params.intensity + params.beat * 0.22);
-
-      let light = colorful * gain + bloom * 0.11;
-
-      // Values above ordinary white are intentionally preserved.
-      // The browser maps them to the display's available HDR headroom.
-      return vec4<f32>(toEncoded(light), 1.0);
-    }
-  `;
+    // Preserve values above SDR white for the extended HDR canvas.
+    return vec4<f32>(toEncoded(colorful * gain), 1.0);
+  }
+`;
 
   async function enableHDR() {
     if (gpu || hdrStarting) return;
@@ -2201,145 +2168,166 @@
     }
   }
 
-  function prepareGPUSize(g) {
-    const sourceWidth = canvas.width;
-    const sourceHeight = canvas.height;
-    const limit = g.device.limits.maxTextureDimension2D;
+// Balanced default for animated neon: about one million source pixels.
+// Try 750000 for more speed, or 1600000 for more detail.
+const HDR_PIXEL_BUDGET = 1100000;
 
-    if (sourceWidth > limit || sourceHeight > limit) {
-      throw new Error("The canvas is larger than this GPU can process.");
-    }
+function prepareGPUSize(g) {
+  const limit = g.device.limits.maxTextureDimension2D;
 
-    /*
-     * Limit the extra HDR presentation pass to about four million pixels.
-     * The original scene still renders at its existing Retina resolution.
-     * This keeps the additional GPU cost reasonable on a laptop.
-     */
-    const scale = Math.min(
-      1,
-      Math.sqrt(4000000 / (sourceWidth * sourceHeight))
+  const renderScale = Math.min(
+    window.devicePixelRatio || 1,
+    1.25,
+    Math.sqrt(HDR_PIXEL_BUDGET / (width * height)),
+    limit / width,
+    limit / height
+  );
+
+  const sourceWidth = Math.max(
+    1, Math.floor(width * renderScale)
+  );
+
+  const sourceHeight = Math.max(
+    1, Math.floor(height * renderScale)
+  );
+
+  // Resize the actual Canvas 2D source, not only the HDR overlay.
+  // Keep drawing coordinates in CSS pixels.
+  if (
+    canvas.width !== sourceWidth ||
+    canvas.height !== sourceHeight
+  ) {
+    canvas.width = sourceWidth;
+    canvas.height = sourceHeight;
+
+    ctx.setTransform(
+      sourceWidth / width, 0,
+      0, sourceHeight / height,
+      0, 0
     );
 
-    const outputWidth = Math.max(1, Math.round(sourceWidth * scale));
-    const outputHeight = Math.max(1, Math.round(sourceHeight * scale));
+    // Leave the main app's `dpr` variable unchanged. It tracks the
+    // physical display DPR and is also used to detect monitor changes.
+    invalidateGradients();
+    clearNextFrame = true;
 
-    if (
-      hdrCanvas.width !== outputWidth ||
-      hdrCanvas.height !== outputHeight
-    ) {
-      hdrCanvas.width = outputWidth;
-      hdrCanvas.height = outputHeight;
-    }
-
-    if (
-      g.sourceWidth === sourceWidth &&
-      g.sourceHeight === sourceHeight &&
-      g.texture
-    ) {
-      return;
-    }
-
-    g.texture?.destroy();
-
-    g.sourceWidth = sourceWidth;
-    g.sourceHeight = sourceHeight;
-
-    g.texture = g.device.createTexture({
-      label: "CHROMA source scene",
-      size: [sourceWidth, sourceHeight],
-      format: "rgba8unorm",
-      usage:
-        GPUTextureUsage.TEXTURE_BINDING |
-        GPUTextureUsage.COPY_DST |
-        GPUTextureUsage.RENDER_ATTACHMENT
-    });
-
-    g.bindGroup = g.device.createBindGroup({
-      layout: g.pipeline.getBindGroupLayout(0),
-      entries: [
-        {
-          binding: 0,
-          resource: g.texture.createView()
-        },
-        {
-          binding: 1,
-          resource: g.sampler
-        },
-        {
-          binding: 2,
-          resource: { buffer: g.uniform }
-        }
-      ]
-    });
+    // Resizing clears the source. Draw it again before presenting it.
+    return false;
   }
 
-  function presentHDR() {
-    const g = gpu;
-
-    if (!g || g.busy || document.hidden) return;
-
-    try {
-      prepareGPUSize(g);
-
-      // Browser-managed conversion from the original canvas into Display P3.
-      // This is a GPU upload/copy, not a CPU getImageData pixel loop.
-      g.device.queue.copyExternalImageToTexture(
-        { source: canvas },
-        {
-          texture: g.texture,
-          colorSpace: "display-p3",
-          premultipliedAlpha: false
-        },
-        [g.sourceWidth, g.sourceHeight]
-      );
-
-      g.parameters[0] = 1 / g.sourceWidth;
-      g.parameters[1] = 1 / g.sourceHeight;
-
-      // Conservative highlight lift. This is not a requested nit value.
-      g.parameters[2] = 2.0;
-
-      // Respect reduced-motion preferences for extra brightness modulation.
-      g.parameters[3] = reducedMotion.matches ? 0 : rhythm.pulse;
-
-      g.device.queue.writeBuffer(g.uniform, 0, g.parameters);
-
-      const encoder = g.device.createCommandEncoder();
-
-      const pass = encoder.beginRenderPass({
-        colorAttachments: [{
-          view: g.context.getCurrentTexture().createView(),
-          loadOp: "clear",
-          storeOp: "store",
-          clearValue: { r: 0, g: 0, b: 0, a: 1 }
-        }]
-      });
-
-      pass.setPipeline(g.pipeline);
-      pass.setBindGroup(0, g.bindGroup);
-      pass.draw(3);
-      pass.end();
-
-      g.device.queue.submit([encoder.finish()]);
-      hdrCanvas.hidden = false;
-
-      // Avoid building an ever-growing GPU queue on a slower device.
-      g.busy = true;
-
-      g.device.queue.onSubmittedWorkDone().then(
-        () => { g.busy = false; },
-        () => {
-          if (gpu !== g) return;
-          disableHDR();
-          showNotice("HDR rendering was interrupted. Switched back to SDR.");
-        }
-      );
-    } catch (error) {
-      console.warn("CHROMA HDR presentation:", error);
-      disableHDR();
-      showNotice("HDR could not continue. The normal visualizer is still running.");
-    }
+  if (
+    hdrCanvas.width !== sourceWidth ||
+    hdrCanvas.height !== sourceHeight
+  ) {
+    hdrCanvas.width = sourceWidth;
+    hdrCanvas.height = sourceHeight;
   }
+
+  if (
+    g.sourceWidth === sourceWidth &&
+    g.sourceHeight === sourceHeight &&
+    g.texture
+  ) {
+    return true;
+  }
+
+  g.texture?.destroy();
+
+  g.sourceWidth = sourceWidth;
+  g.sourceHeight = sourceHeight;
+
+  g.texture = g.device.createTexture({
+    label: "CHROMA optimized HDR source",
+    size: [sourceWidth, sourceHeight],
+    format: "rgba8unorm",
+    usage:
+      GPUTextureUsage.TEXTURE_BINDING |
+      GPUTextureUsage.COPY_DST |
+      GPUTextureUsage.RENDER_ATTACHMENT
+  });
+
+  g.bindGroup = g.device.createBindGroup({
+    layout: g.pipeline.getBindGroupLayout(0),
+    entries: [
+      {
+        binding: 0,
+        resource: g.texture.createView()
+      },
+      {
+        binding: 1,
+        resource: g.sampler
+      },
+      {
+        binding: 2,
+        resource: { buffer: g.uniform }
+      }
+    ]
+  });
+
+  return true;
+}
+
+function presentHDR() {
+  const g = gpu;
+
+  if (!g || document.hidden) return;
+
+  try {
+    // A resized source needs one fresh draw before it is copied.
+    if (!prepareGPUSize(g)) return;
+
+    g.device.queue.copyExternalImageToTexture(
+      { source: canvas },
+      {
+        texture: g.texture,
+        colorSpace: "display-p3",
+        premultipliedAlpha: false
+      },
+      [g.sourceWidth, g.sourceHeight]
+    );
+
+    g.parameters[0] = 1 / g.sourceWidth;
+    g.parameters[1] = 1 / g.sourceHeight;
+
+    // Same HDR highlight intensity as the previous version.
+    g.parameters[2] = 2.0;
+    g.parameters[3] = reducedMotion.matches ? 0 : rhythm.pulse;
+
+    g.device.queue.writeBuffer(
+      g.uniform,
+      0,
+      g.parameters
+    );
+
+    const encoder = g.device.createCommandEncoder();
+
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: g.context.getCurrentTexture().createView(),
+        loadOp: "clear",
+        storeOp: "store",
+        clearValue: { r: 0, g: 0, b: 0, a: 1 }
+      }]
+    });
+
+    pass.setPipeline(g.pipeline);
+    pass.setBindGroup(0, g.bindGroup);
+    pass.draw(3);
+    pass.end();
+
+    // Submit without serializing every frame behind a completion Promise.
+    g.device.queue.submit([encoder.finish()]);
+
+    hdrCanvas.hidden = false;
+  } catch (error) {
+    console.warn("CHROMA HDR presentation:", error);
+    disableHDR();
+
+    showNotice(
+      "HDR could not continue. The normal visualizer is still running."
+    );
+  }
+}
 
   hdrButton.addEventListener("click", () => {
     wakeHUD();
