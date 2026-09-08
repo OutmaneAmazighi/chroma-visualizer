@@ -1,0 +1,1496 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0a0a0f">
+  <title>CHROMA — Live Audio Visualizer</title>
+
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0a0a0f;
+      --text: #eef2ff;
+      --muted: #969bab;
+      --accent: #59f5ff;
+      --border: rgba(255, 255, 255, .11);
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+    }
+
+    button, select, input { font: inherit; }
+    button, select { -webkit-tap-highlight-color: transparent; }
+    button { cursor: pointer; }
+    button:disabled { cursor: wait; opacity: .55; }
+    [hidden] { display: none !important; }
+
+    button:focus-visible, select:focus-visible, input:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 4px;
+    }
+
+    #visualizer {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    .masthead {
+      position: fixed;
+      z-index: 2;
+      top: max(26px, env(safe-area-inset-top));
+      left: max(28px, env(safe-area-inset-left));
+      pointer-events: none;
+      user-select: none;
+    }
+
+    .brand {
+      font-size: 14px;
+      font-weight: 800;
+      letter-spacing: .34em;
+    }
+
+    .brand span { color: var(--accent); }
+
+    .eyebrow {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 9px;
+      letter-spacing: .22em;
+      text-transform: uppercase;
+    }
+
+    .status {
+      position: fixed;
+      z-index: 2;
+      top: max(28px, env(safe-area-inset-top));
+      right: max(28px, env(safe-area-inset-right));
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 10px;
+      letter-spacing: .12em;
+      text-transform: uppercase;
+    }
+
+    .status-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: #6d7281;
+    }
+
+    .status.live .status-dot {
+      background: var(--accent);
+      box-shadow: 0 0 12px var(--accent);
+    }
+
+    .start-card {
+      position: fixed;
+      z-index: 3;
+      top: 44%;
+      left: 50%;
+      width: min(390px, calc(100vw - 36px));
+      padding: 32px;
+      transform: translate(-50%, -50%);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background: rgba(12, 14, 23, .84);
+      backdrop-filter: blur(24px);
+      -webkit-backdrop-filter: blur(24px);
+      box-shadow: 0 24px 100px #0008;
+      text-align: center;
+    }
+
+    .start-card .kicker {
+      color: var(--accent);
+      font-size: 10px;
+      letter-spacing: .2em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 16px 0 12px;
+      font-size: clamp(28px, 5vw, 38px);
+      line-height: 1.08;
+      letter-spacing: -.05em;
+    }
+
+    .start-card p {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+
+    .primary {
+      width: 100%;
+      margin-top: 12px;
+      padding: 13px 20px;
+      border: 0;
+      border-radius: 12px;
+      background: var(--accent);
+      color: #071116;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .privacy {
+      display: block;
+      margin-top: 16px;
+      color: #888e9f;
+      font-size: 10px;
+      line-height: 1.6;
+    }
+
+    #error {
+      margin: 14px 0 0;
+      color: #ff9fab;
+      font-size: 12px;
+    }
+
+    .hud {
+      position: fixed;
+      z-index: 4;
+      bottom: max(24px, env(safe-area-inset-bottom));
+      left: 50%;
+      display: flex;
+      align-items: center;
+      gap: 22px;
+      max-width: calc(100vw - 28px);
+      padding: 16px 18px;
+      transform: translateX(-50%);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      background: rgba(19, 21, 32, .72);
+      backdrop-filter: blur(24px) saturate(130%);
+      -webkit-backdrop-filter: blur(24px) saturate(130%);
+      box-shadow: 0 16px 60px #0007;
+      transition: opacity .6s ease, border-color .3s ease;
+    }
+
+    body.idle .hud { opacity: .22; }
+
+    body.idle .hud:hover,
+    body.idle .hud:focus-within { opacity: 1; }
+
+    .control-group { display: grid; gap: 8px; }
+
+    .control-label {
+      display: flex;
+      justify-content: space-between;
+      color: var(--muted);
+      font-size: 9px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+
+    .modes {
+      display: flex;
+      gap: 3px;
+      padding: 3px;
+      border: 1px solid rgba(255, 255, 255, .05);
+      border-radius: 10px;
+      background: #0003;
+    }
+
+    .mode, .utility {
+      min-height: 33px;
+      padding: 7px 13px;
+      border: 1px solid transparent;
+      border-radius: 7px;
+      background: transparent;
+      color: #989eaf;
+      font-size: 11px;
+      white-space: nowrap;
+      transition: color .2s, background .2s;
+    }
+
+    .mode:hover, .utility:hover {
+      background: #ffffff0d;
+      color: white;
+    }
+
+    .mode[aria-pressed="true"] {
+      border-color: #ffffff12;
+      background: #ffffff12;
+      color: var(--accent);
+    }
+
+    select {
+      width: 148px;
+      min-height: 39px;
+      padding: 0 10px;
+      border: 1px solid var(--border);
+      border-radius: 9px;
+      background: #151722;
+      color: var(--text);
+      font-size: 11px;
+    }
+
+    .gain-group { width: 125px; }
+
+    input[type="range"] {
+      width: 100%;
+      height: 39px;
+      margin: 0;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+
+    .utilities {
+      display: flex;
+      gap: 6px;
+      align-self: end;
+      padding-bottom: 3px;
+    }
+
+    .utility {
+      border-color: var(--border);
+      color: #d0d5e3;
+    }
+
+    #notice {
+      position: fixed;
+      z-index: 5;
+      bottom: 150px;
+      left: 50%;
+      max-width: calc(100vw - 40px);
+      padding: 10px 16px;
+      transform: translateX(-50%);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #171924;
+      color: #d3d8e5;
+      font-size: 12px;
+      text-align: center;
+    }
+
+    @media (max-width: 760px) {
+      .hud {
+        width: min(460px, calc(100vw - 24px));
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 12px 16px;
+        padding: 14px;
+      }
+
+      .modes .mode { padding-inline: 12px; }
+      select { width: 142px; }
+      .gain-group { flex: 1; max-width: 205px; }
+      .utilities { align-self: center; padding: 0; }
+      .masthead { left: 20px; top: 20px; }
+      .status { right: 20px; top: 22px; font-size: 8px; }
+      .eyebrow { font-size: 8px; }
+      .start-card { top: 40%; padding: 25px; }
+      #notice { bottom: 195px; }
+    }
+
+    @media (max-height: 520px) {
+      .start-card { top: 39%; padding: 16px 24px; }
+      .start-card h1 { margin: 8px 0; font-size: 26px; }
+      .start-card p { margin: 6px 0; }
+      .privacy { margin-top: 8px; }
+      .hud { bottom: 10px; padding: 10px 14px; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .hud, .mode, .utility { transition: none; }
+    }
+  </style>
+</head>
+
+<body>
+  <canvas id="visualizer" aria-label="Live microphone audio visualizer">
+    Your browser does not support the Canvas API.
+  </canvas>
+
+  <header class="masthead">
+    <div class="brand">CHROMA<span> /</span></div>
+    <div class="eyebrow">Sound into light</div>
+  </header>
+
+  <div id="status" class="status" role="status">
+    <span class="status-dot" aria-hidden="true"></span>
+    <span id="statusText">Preview · mic off</span>
+  </div>
+
+  <main id="startCard" class="start-card">
+    <div class="kicker">Realtime audio reactive</div>
+    <h1>Give your sound<br>a spectrum.</h1>
+    <p>Turn on your microphone and watch the room come alive in color.</p>
+    <button id="startButton" class="primary" type="button">Start Mic →</button>
+    <small class="privacy">
+      Audio stays on your device.<br>
+      No recording. No uploads. No speaker feedback.
+    </small>
+    <p id="error" role="alert" hidden></p>
+  </main>
+
+  <section class="hud" aria-label="Visualizer controls">
+    <div class="control-group">
+      <span id="modeLabel" class="control-label">Visual mode</span>
+      <div class="modes" role="group" aria-labelledby="modeLabel">
+        <button type="button" class="mode"
+                data-mode="bars" aria-pressed="true">Bars</button>
+        <button type="button" class="mode"
+                data-mode="radial" aria-pressed="false">Radial</button>
+        <button type="button" class="mode"
+                data-mode="wave" aria-pressed="false">Wave</button>
+      </div>
+    </div>
+
+    <div class="control-group">
+      <label class="control-label" for="palette">RGB palette</label>
+      <select id="palette">
+        <option value="cyberpunk">Cyberpunk</option>
+        <option value="rainbow">Rainbow Wave</option>
+        <option value="solar">Solar Flare</option>
+        <option value="toxic">Toxic Matrix</option>
+      </select>
+    </div>
+
+    <div class="control-group gain-group">
+      <label class="control-label" for="gain">
+        Sensitivity <output id="gainValue" for="gain">1.4×</output>
+      </label>
+      <input id="gain" type="range"
+             min="0.2" max="4" step="0.1" value="1.4">
+    </div>
+
+    <div class="utilities">
+      <button id="micButton" class="utility"
+              type="button" hidden>Stop mic</button>
+      <button id="fullscreenButton" class="utility" type="button"
+              aria-label="Enter fullscreen"
+              aria-pressed="false">⛶ Full</button>
+    </div>
+  </section>
+
+  <div id="notice" role="status" hidden></div>
+
+  <script>
+    "use strict";
+
+    // ============================================================
+    // DOM / visual configuration
+    // ============================================================
+    const $ = selector => document.querySelector(selector);
+
+    const canvas = $("#visualizer");
+    const ctx = canvas.getContext("2d", { alpha: false });
+
+    const startCard = $("#startCard");
+    const startButton = $("#startButton");
+    const micButton = $("#micButton");
+    const errorElement = $("#error");
+    const statusElement = $("#status");
+    const statusText = $("#statusText");
+    const fullscreenButton = $("#fullscreenButton");
+    const hud = $(".hud");
+    const modeButtons = [...document.querySelectorAll("[data-mode]")];
+
+    const BG = "#0a0a0f";
+    const TAU = Math.PI * 2;
+    const BAND_COUNT = 72;
+    const COLOR_COUNT = 24;
+    const WAVE_POINT_COUNT = 512;
+    const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
+
+    let width = 1;
+    let height = 1;
+    let dpr = 1;
+    let mode = "bars";
+    let palette = "cyberpunk";
+    let sensitivity = 1.4;
+    let bass = 0;
+    let waveAutoGain = 1;
+    let previousTime = 0;
+    let clearNextFrame = true;
+    let lastColorUpdate = -Infinity;
+
+    const bands = new Float32Array(BAND_COUNT);
+    const peaks = new Float32Array(BAND_COUNT);
+    const peakHold = new Float32Array(BAND_COUNT);
+    const bandStart = new Uint16Array(BAND_COUNT);
+    const bandEnd = new Uint16Array(BAND_COUNT);
+    const wavePoints = new Float32Array(WAVE_POINT_COUNT);
+    const colors = new Array(COLOR_COUNT);
+
+    // Precomputed drawing batches avoid scanning all bars for every color.
+    const colorGroups = Array.from({ length: COLOR_COUNT }, () => []);
+    const bandColors = new Uint8Array(BAND_COUNT);
+
+    for (let i = 0; i < BAND_COUNT; i++) {
+      const c = Math.min(
+        COLOR_COUNT - 1,
+        Math.floor(i / BAND_COUNT * COLOR_COUNT)
+      );
+      bandColors[i] = c;
+      colorGroups[c].push(i);
+    }
+
+    const dust = Array.from({ length: 48 }, () => ({
+      x: Math.random(),
+      y: Math.random(),
+      radius: Math.random() * 1.2 + .3,
+      speed: Math.random() * .012 + .003,
+      phase: Math.random() * TAU
+    }));
+
+    // Cached gradients are rebuilt only when their dependencies change.
+    let waveGradient = null;
+    let coreGradient = null;
+
+    function invalidateGradients() {
+      waveGradient = null;
+      coreGradient = null;
+    }
+
+    function resize() {
+      width = Math.max(1, window.innerWidth);
+      height = Math.max(1, window.innerHeight);
+      dpr = window.devicePixelRatio || 1;
+
+      canvas.width = Math.round(width * dpr);
+      canvas.height = Math.round(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      invalidateGradients();
+      clearNextFrame = true;
+    }
+
+    function resetSignal() {
+      bands.fill(0);
+      peaks.fill(0);
+      peakHold.fill(0);
+      wavePoints.fill(0);
+      waveAutoGain = 1;
+      bass = 0;
+      clearNextFrame = true;
+    }
+
+    function updateColors(time) {
+      if (time - lastColorUpdate < 1 / 12) return;
+      lastColorUpdate = time;
+
+      const cycle = reducedMotion.matches ? 0 : time;
+
+      for (let i = 0; i < COLOR_COUNT; i++) {
+        const p = i / (COLOR_COUNT - 1);
+        let hue;
+        let lightness = 62;
+
+        switch (palette) {
+          case "rainbow":
+            hue = (p * 320 + cycle * 30) % 360;
+            break;
+          case "solar":
+            hue = 8 + p * 43;
+            lightness = 57 + p * 9;
+            break;
+          case "toxic":
+            hue = 105 + p * 48;
+            lightness = 49 + p * 16;
+            break;
+          default:
+            hue = 183 + p * 130 + Math.sin(cycle * .3) * 8;
+        }
+
+        colors[i] = `hsl(${hue.toFixed(1)}, 100%, ${lightness}%)`;
+      }
+
+      invalidateGradients();
+    }
+
+    // ============================================================
+    // Audio lifecycle
+    //
+    // Each start owns a separate session. A cancelled permission
+    // request cannot attach its stream to a newer audio context.
+    //
+    // Graph: microphone -> analyser
+    // No speaker output, monitor, or feedback connection.
+    // ============================================================
+    let session = null;
+
+    function isCurrent(s) {
+      return session === s && !s.disposed;
+    }
+
+    function disposeSession(s) {
+      if (!s || s.disposed) return;
+      s.disposed = true;
+
+      for (const cleanup of s.cleanups) cleanup();
+      s.cleanups.length = 0;
+
+      try { s.source?.disconnect(); } catch {}
+      try { s.analyser?.disconnect(); } catch {}
+
+      s.stream?.getTracks().forEach(track => track.stop());
+
+      if (s.context && s.context.state !== "closed") {
+        s.context.close().catch(() => {});
+      }
+    }
+
+    function listen(s, target, event, handler) {
+      target.addEventListener(event, handler);
+      s.cleanups.push(() => target.removeEventListener(event, handler));
+    }
+
+    function updateAudioUI() {
+      const s = session;
+      const ready = !!s?.ready;
+      const running = ready && s.context.state === "running";
+      const muted = ready && (s.track.muted || !s.track.enabled);
+
+      startButton.disabled = !!s && !ready;
+      startButton.textContent = s && !ready ? "Connecting…" : "Start Mic →";
+      startCard.hidden = ready;
+      micButton.hidden = !s;
+      statusElement.classList.toggle("live", running && !muted);
+
+      if (!s) {
+        statusText.textContent = "Preview · mic off";
+        statusElement.title = "";
+      } else if (!ready) {
+        statusText.textContent = "Connecting · microphone";
+        micButton.textContent = "Cancel";
+      } else if (!running) {
+        statusText.textContent = "Audio paused";
+        micButton.textContent = "Resume";
+      } else if (muted) {
+        statusText.textContent = "Mic temporarily muted";
+        micButton.textContent = "Stop mic";
+      } else {
+        statusText.textContent = "Live · microphone";
+        micButton.textContent = "Stop mic";
+      }
+    }
+
+    function friendlyAudioError(error) {
+      switch (error?.name) {
+        case "NotAllowedError":
+        case "SecurityError":
+          return "Microphone access was blocked. Allow it in your browser’s site settings. Embedded pages also need microphone permission from their host.";
+        case "NotFoundError":
+        case "DevicesNotFoundError":
+          return "No microphone was found. Connect or enable an input device, then try again.";
+        case "NotReadableError":
+        case "TrackStartError":
+          return "The microphone could not be opened. Check your operating system’s microphone permissions and whether another application is using it.";
+        case "OverconstrainedError":
+          return "The microphone cannot provide a supported audio input.";
+        case "AbortError":
+          return "Microphone startup was interrupted. Please try again.";
+        default:
+          return error?.message || "Could not start the microphone. Please try again.";
+      }
+    }
+
+    async function requestMicrophone() {
+      // Raw capture is preferable for music and environmental sound.
+      // Unsupported preferences may be ignored by the browser.
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 1
+          }
+        });
+      } catch (error) {
+        // Retry only a constraints failure, not a permission denial.
+        if (error.name !== "OverconstrainedError") throw error;
+        return await navigator.mediaDevices.getUserMedia({ audio: true });
+      }
+    }
+
+    function configureFrequencyBands(s) {
+      const count = s.analyser.frequencyBinCount;
+      const binHz = s.context.sampleRate / s.analyser.fftSize;
+      const lowFrequency = 28;
+      const highFrequency = Math.min(17000, s.context.sampleRate / 2);
+
+      for (let i = 0; i < BAND_COUNT; i++) {
+        const low = lowFrequency * Math.pow(
+          highFrequency / lowFrequency, i / BAND_COUNT
+        );
+        const high = lowFrequency * Math.pow(
+          highFrequency / lowFrequency, (i + 1) / BAND_COUNT
+        );
+
+        const first = Math.max(
+          1, Math.min(count - 1, Math.round(low / binHz))
+        );
+
+        bandStart[i] = first;
+        bandEnd[i] = Math.min(
+          count, Math.max(first + 1, Math.round(high / binHz))
+        );
+      }
+
+      s.bassStart = Math.max(1, Math.floor(35 / binHz));
+      s.bassEnd = Math.min(count - 1, Math.ceil(180 / binHz));
+    }
+
+    async function startMic() {
+      if (session) return;
+
+      errorElement.hidden = true;
+
+      const s = {
+        context: null,
+        stream: null,
+        source: null,
+        analyser: null,
+        track: null,
+        frequencyData: null,
+        timeData: null,
+        cleanups: [],
+        ready: false,
+        disposed: false,
+        silenceTime: 0,
+        silenceNotified: false,
+        lastTelemetry: 0,
+        inputRms: 0,
+        inputPeak: 0
+      };
+
+      session = s;
+      updateAudioUI();
+      wakeHUD();
+
+      try {
+        if (!window.isSecureContext) {
+          throw new Error(
+            "Microphone access requires HTTPS or localhost. Open this page through a local web server or a secure website."
+          );
+        }
+
+        if (!navigator.mediaDevices?.getUserMedia) {
+          throw new Error(
+            "Microphone capture is unavailable in this browser or page."
+          );
+        }
+
+        const AudioContextClass =
+          window.AudioContext || window.webkitAudioContext;
+
+        if (!AudioContextClass) {
+          throw new Error("This browser does not support Web Audio.");
+        }
+
+        // Both construction and resume originate in the button gesture.
+        s.context = new AudioContextClass({ latencyHint: "interactive" });
+        await s.context.resume();
+
+        if (!isCurrent(s)) return;
+
+        // IMPORTANT: await the actual MediaStream and keep it local.
+        // Never pass a Promise, session object, or track to this API.
+        const capturedStream = await requestMicrophone();
+
+        if (!isCurrent(s)) {
+          capturedStream.getTracks().forEach(track => track.stop());
+          return;
+        }
+
+        if (
+          !capturedStream ||
+          typeof capturedStream.getAudioTracks !== "function"
+        ) {
+          throw new Error(
+            "The browser did not return a valid microphone MediaStream."
+          );
+        }
+
+        s.stream = capturedStream;
+        s.track = capturedStream.getAudioTracks().find(
+          track => track.readyState === "live"
+        );
+
+        if (!s.track) {
+          throw new Error("The microphone stream has no live audio track.");
+        }
+
+        s.analyser = s.context.createAnalyser();
+
+        // Higher resolution reveals more individual tones and bass detail.
+        s.analyser.fftSize = 4096;
+
+        // Responsive enough for transients without excessive flicker.
+        s.analyser.smoothingTimeConstant = 0.72;
+
+        // Float frequency data is mapped explicitly below, but keep these
+        // meaningful for debugging or switching to byte data.
+        s.analyser.minDecibels = -100;
+        s.analyser.maxDecibels = -20;
+
+        // Use the resolved MediaStream directly: this fixes the type error.
+        s.source = s.context.createMediaStreamSource(capturedStream);
+        s.source.connect(s.analyser);
+
+        // Deliberately NO connection to audioContext.destination.
+
+        s.frequencyData = new Float32Array(
+          s.analyser.frequencyBinCount
+        );
+        s.timeData = new Float32Array(s.analyser.fftSize);
+        s.frequencyData.fill(-Infinity);
+
+        configureFrequencyBands(s);
+        resetSignal();
+
+        listen(s, s.track, "ended", () => {
+          if (!isCurrent(s)) return;
+          stopMic();
+          showNotice("The microphone disconnected. Press Start Mic to reconnect.");
+        });
+
+        listen(s, s.track, "mute", () => {
+          if (isCurrent(s)) updateAudioUI();
+        });
+
+        listen(s, s.track, "unmute", () => {
+          if (!isCurrent(s)) return;
+          s.silenceTime = 0;
+          clearNextFrame = true;
+          updateAudioUI();
+        });
+
+        listen(s, s.context, "statechange", () => {
+          if (!isCurrent(s)) return;
+
+          if (s.context.state === "closed") {
+            stopMic();
+            showNotice("The audio session closed. Press Start Mic to reconnect.");
+          } else {
+            updateAudioUI();
+          }
+        });
+
+        s.ready = true;
+        updateAudioUI();
+
+        // Useful diagnostics without adding anything to the visual design.
+        console.info("CHROMA microphone:", {
+          device: s.track.label,
+          settings: s.track.getSettings?.(),
+          sampleRate: s.context.sampleRate,
+          fftSize: s.analyser.fftSize
+        });
+
+        micButton.focus({ preventScroll: true });
+      } catch (error) {
+        // An older, cancelled request must not tear down a newer session.
+        if (!isCurrent(s)) return;
+
+        console.error("CHROMA microphone startup:", error);
+        session = null;
+        disposeSession(s);
+        resetSignal();
+        updateAudioUI();
+
+        errorElement.textContent = friendlyAudioError(error);
+        errorElement.hidden = false;
+      }
+    }
+
+    function stopMic() {
+      const oldSession = session;
+      session = null;
+      disposeSession(oldSession);
+      resetSignal();
+      updateAudioUI();
+      wakeHUD();
+    }
+
+    startButton.addEventListener("click", startMic);
+
+    micButton.addEventListener("click", async () => {
+      const s = session;
+      if (!s) return;
+
+      if (!s.ready) {
+        stopMic();
+        startButton.focus({ preventScroll: true });
+        return;
+      }
+
+      if (s.context.state !== "running") {
+        try {
+          await s.context.resume();
+          if (isCurrent(s)) {
+            clearNextFrame = true;
+            updateAudioUI();
+          }
+        } catch (error) {
+          if (isCurrent(s)) showNotice(friendlyAudioError(error));
+        }
+      } else {
+        stopMic();
+        startButton.focus({ preventScroll: true });
+      }
+    });
+
+    // Release the microphone on navigation, including back/forward cache entry.
+    window.addEventListener("pagehide", stopMic);
+
+    // ============================================================
+    // Signal processing
+    // ============================================================
+
+    function spectrumLevel(db) {
+      if (!Number.isFinite(db)) return 0;
+
+      // Visual dB mapping, not a calibrated sound-pressure measurement.
+      // Peak-per-band analysis preserves narrow harmonics.
+      const normalized = Math.max(0, Math.min(1, (db + 100) / 80));
+
+      // A gentle lift makes quiet spectral detail easier to see.
+      // True zero stays zero; no invented live frequency activity.
+      return Math.min(1, Math.pow(normalized, 0.9) * sensitivity);
+    }
+
+    function readAudio(time, dt) {
+      const s = session;
+      const active = !!s?.ready &&
+        s.context.state === "running" &&
+        s.track.readyState === "live" &&
+        !s.track.muted &&
+        s.track.enabled;
+
+      // Preview is shown only when microphone capture is not established.
+      const preview = !s?.ready;
+      const attack = 1 - Math.exp(-dt * 48);
+      const release = 1 - Math.exp(-dt * 13);
+
+      let bassTarget = 0;
+
+      if (active) {
+        s.analyser.getFloatFrequencyData(s.frequencyData);
+        s.analyser.getFloatTimeDomainData(s.timeData);
+
+        let squareSum = 0;
+        let peak = 0;
+
+        for (let i = 0; i < s.timeData.length; i++) {
+          const sample = s.timeData[i];
+          squareSum += sample * sample;
+          peak = Math.max(peak, Math.abs(sample));
+        }
+
+        const rms = Math.sqrt(squareSum / s.timeData.length);
+        s.inputRms = rms;
+        s.inputPeak = peak;
+
+        // Bounded waveform display AGC, independent of spectrum heights.
+        // Never normalize arbitrary near-silence to a full-screen trace.
+        let desiredGain = 1;
+
+        if (rms > 0.0003) {
+          desiredGain = Math.max(
+            1,
+            Math.min(
+              16,
+              0.12 / rms,
+              0.85 / Math.max(peak, 0.000001)
+            )
+          );
+        }
+
+        const gainRate = desiredGain < waveAutoGain ? 40 : 2;
+        waveAutoGain += (desiredGain - waveAutoGain)
+          * (1 - Math.exp(-dt * gainRate));
+
+        let bassSum = 0;
+        let bassPeak = 0;
+
+        for (let i = s.bassStart; i <= s.bassEnd; i++) {
+          const level = spectrumLevel(s.frequencyData[i]);
+          bassSum += level;
+          bassPeak = Math.max(bassPeak, level);
+        }
+
+        const bassAverage = bassSum / (s.bassEnd - s.bassStart + 1);
+        bassTarget = bassAverage * .65 + bassPeak * .35;
+
+        // Detect essentially digital silence, not merely a quiet room.
+        s.silenceTime = peak < 0.00001 ? s.silenceTime + dt : 0;
+
+        if (s.silenceTime > 7 && !s.silenceNotified) {
+          s.silenceNotified = true;
+          showNotice(
+            "The microphone is connected but sending almost no signal. Check the selected browser input and your system’s microphone level."
+          );
+        }
+
+        if (time - s.lastTelemetry > .5) {
+          s.lastTelemetry = time;
+          const db = 20 * Math.log10(Math.max(rms, 1e-8));
+          statusElement.title =
+            `${s.track.label || "Microphone"} · RMS ${db.toFixed(1)} dBFS` +
+            (peak >= .99 ? " · Input may be clipping" : "");
+        }
+      } else {
+        waveAutoGain = 1;
+      }
+
+      for (let i = 0; i < BAND_COUNT; i++) {
+        let target = 0;
+
+        if (active) {
+          let strongestDb = -Infinity;
+
+          for (let bin = bandStart[i]; bin < bandEnd[i]; bin++) {
+            strongestDb = Math.max(strongestDb, s.frequencyData[bin]);
+          }
+
+          target = spectrumLevel(strongestDb);
+        } else if (preview) {
+          const t = reducedMotion.matches ? 0 : time;
+
+          target = (
+            .07 + .13 * Math.pow(Math.sin(i * .16 + t * .7), 2)
+          ) * (
+            .65 + .35 * Math.sin(i * .07 + 1)
+          );
+        }
+
+        const response = target > bands[i] ? attack : release;
+        bands[i] += (target - bands[i]) * response;
+
+        if (bands[i] >= peaks[i]) {
+          peaks[i] = bands[i];
+          peakHold[i] = .15;
+        } else {
+          peakHold[i] = Math.max(0, peakHold[i] - dt);
+
+          if (peakHold[i] === 0) {
+            peaks[i] = Math.max(bands[i], peaks[i] - dt * .3);
+          }
+        }
+      }
+
+      bass += (bassTarget - bass)
+        * (1 - Math.exp(-dt * (bassTarget > bass ? 30 : 10)));
+
+      if (mode !== "wave") return;
+
+      let offset = 0;
+      let span = 0;
+
+      if (active) {
+        // A short, stable window avoids overcrowding the scope after
+        // increasing FFT size. It is independent of the FFT buffer length.
+        span = Math.min(
+          s.timeData.length - 2,
+          Math.round(s.context.sampleRate * .016)
+        );
+
+        const searchEnd = Math.min(
+          512, s.timeData.length - span - 2
+        );
+
+        let bestSlope = 0;
+
+        for (let i = 1; i <= searchEnd; i++) {
+          const slope = s.timeData[i] - s.timeData[i - 1];
+
+          if (
+            s.timeData[i - 1] <= 0 &&
+            s.timeData[i] > 0 &&
+            slope > bestSlope
+          ) {
+            offset = i;
+            bestSlope = slope;
+          }
+        }
+      }
+
+      for (let i = 0; i < WAVE_POINT_COUNT; i++) {
+        let target = 0;
+
+        if (active) {
+          const position = offset + i / (WAVE_POINT_COUNT - 1) * span;
+          const index = Math.floor(position);
+          const fraction = position - index;
+
+          const sample = s.timeData[index] * (1 - fraction)
+            + s.timeData[Math.min(index + 1, s.timeData.length - 1)]
+              * fraction;
+
+          // Soft limiting affects drawing coordinates only.
+          target = Math.tanh(sample * waveAutoGain * sensitivity);
+        } else if (preview) {
+          const t = reducedMotion.matches ? 0 : time;
+          const p = i / (WAVE_POINT_COUNT - 1) * 255;
+
+          target = Math.sin(p * .045 - t) * .12
+            + Math.sin(p * .095 + t * .6) * .045;
+        }
+
+        wavePoints[i] = target;
+      }
+    }
+
+    // ============================================================
+    // Rendering — original CHROMA visual language
+    // ============================================================
+    function drawDust(time, dt) {
+      const t = reducedMotion.matches ? 0 : time;
+
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.fillStyle = colors[3];
+
+      for (const particle of dust) {
+        if (!reducedMotion.matches) {
+          particle.y -= particle.speed * dt;
+          if (particle.y < -.01) particle.y = 1.01;
+        }
+
+        const drift = reducedMotion.matches
+          ? 0 : Math.sin(t * .15 + particle.phase) * 12;
+
+        ctx.globalAlpha =
+          .11 + (Math.sin(particle.phase + t * .35) + 1) * .07;
+
+        ctx.beginPath();
+        ctx.arc(
+          particle.x * width + drift,
+          particle.y * height,
+          particle.radius,
+          0, TAU
+        );
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+
+    function drawBars() {
+      const availableWidth = Math.min(width * .87, 1340);
+      const step = availableWidth / BAND_COUNT;
+      const barWidth = Math.max(2, step * .58);
+      const left = (width - availableWidth) / 2;
+      const baseline = height * .72;
+      const maxHeight = Math.min(height * .46, 450);
+
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.lineCap = "round";
+
+      for (let c = 0; c < COLOR_COUNT; c++) {
+        ctx.beginPath();
+
+        for (const i of colorGroups[c]) {
+          const x = left + (i + .5) * step;
+          const barHeight = Math.max(1, bands[i] * maxHeight);
+
+          ctx.moveTo(x, baseline - barWidth / 2);
+          ctx.lineTo(x, baseline - barWidth / 2 - barHeight);
+        }
+
+        ctx.strokeStyle = colors[c];
+        ctx.shadowColor = colors[c];
+        ctx.shadowBlur = 14;
+        ctx.lineWidth = barWidth;
+        ctx.globalAlpha = .82;
+        ctx.stroke();
+
+        ctx.shadowBlur = 0;
+        ctx.lineWidth = Math.max(1, barWidth * .3);
+        ctx.globalAlpha = .5;
+        ctx.stroke();
+      }
+
+      ctx.globalAlpha = .8;
+
+      for (let i = 0; i < BAND_COUNT; i++) {
+        const x = left + (i + .5) * step;
+        const y = baseline - peaks[i] * maxHeight - barWidth - 7;
+
+        ctx.fillStyle = colors[bandColors[i]];
+        ctx.fillRect(x - barWidth / 2, y, barWidth, 2);
+      }
+
+      ctx.globalAlpha = .1;
+      ctx.strokeStyle = colors[0];
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(left, baseline + 9);
+      ctx.lineTo(left + availableWidth, baseline + 9);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    function drawRadial(time) {
+      const cx = width / 2;
+      const cy = height * .44;
+      const size = Math.min(width, height * .82);
+      const radius = size * (.19 + bass * .032);
+      const extension = size * .18;
+      const rotation = reducedMotion.matches ? 0 : time * .025;
+
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      ctx.lineCap = "round";
+      ctx.lineWidth = Math.max(2, Math.min(7, size * .008));
+
+      for (let c = 0; c < COLOR_COUNT; c++) {
+        ctx.beginPath();
+
+        for (const i of colorGroups[c]) {
+          const angle = i / BAND_COUNT * TAU - Math.PI / 2 + rotation;
+
+          // Mirror around the ring while including BOTH bands in each pair.
+          // The previous version skipped odd-numbered frequency bands.
+          const pair = i < BAND_COUNT / 2
+            ? i : BAND_COUNT - 1 - i;
+
+          const band = pair * 2;
+          const level = Math.max(bands[band], bands[band + 1]);
+          const length = 3 + level * extension;
+          const cos = Math.cos(angle);
+          const sin = Math.sin(angle);
+
+          ctx.moveTo(cx + cos * radius, cy + sin * radius);
+          ctx.lineTo(
+            cx + cos * (radius + length),
+            cy + sin * (radius + length)
+          );
+        }
+
+        ctx.strokeStyle = colors[c];
+        ctx.shadowColor = colors[c];
+        ctx.shadowBlur = 15;
+        ctx.globalAlpha = .9;
+        ctx.stroke();
+      }
+
+      ctx.shadowColor = colors[0];
+      ctx.strokeStyle = colors[0];
+      ctx.shadowBlur = 20 + bass * 16;
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = .4 + bass * .5;
+
+      ctx.beginPath();
+      ctx.arc(cx, cy, Math.max(1, radius - 9), 0, TAU);
+      ctx.stroke();
+
+      ctx.shadowBlur = 0;
+      ctx.globalAlpha = .13;
+      ctx.lineWidth = 1;
+
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius * .72, 0, TAU);
+      ctx.stroke();
+
+      // Draw the core in normalized coordinates so the gradient is reusable
+      // while the ring radius changes with bass.
+      ctx.translate(cx, cy);
+      ctx.scale(radius * .8, radius * .8);
+
+      if (!coreGradient) {
+        coreGradient = ctx.createRadialGradient(0, 0, 0, 0, 0, 1);
+        coreGradient.addColorStop(0, colors[5]);
+        coreGradient.addColorStop(1, "transparent");
+      }
+
+      ctx.fillStyle = coreGradient;
+      ctx.globalAlpha = .035 + bass * .13;
+      ctx.beginPath();
+      ctx.arc(0, 0, 1, 0, TAU);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function traceWave(left, center, span, amplitude) {
+      const step = span / (WAVE_POINT_COUNT - 1);
+
+      ctx.beginPath();
+      ctx.moveTo(left, center + wavePoints[0] * amplitude);
+
+      for (let i = 1; i < WAVE_POINT_COUNT - 1; i++) {
+        const x = left + i * step;
+        const y = center + wavePoints[i] * amplitude;
+        const nextY = center + wavePoints[i + 1] * amplitude;
+
+        ctx.quadraticCurveTo(
+          x, y,
+          x + step / 2,
+          (y + nextY) / 2
+        );
+      }
+
+      ctx.lineTo(
+        left + span,
+        center + wavePoints[WAVE_POINT_COUNT - 1] * amplitude
+      );
+    }
+
+    function drawWave() {
+      const left = width * .07;
+      const span = width * .86;
+      const center = height * .45;
+      const amplitude = Math.min(height * .29, 260);
+
+      ctx.save();
+      ctx.strokeStyle = "#8090b8";
+      ctx.globalAlpha = .055;
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+
+      for (let i = 0; i <= 12; i++) {
+        const x = left + span * i / 12;
+        ctx.moveTo(x, center - amplitude);
+        ctx.lineTo(x, center + amplitude);
+      }
+
+      for (let i = -2; i <= 2; i++) {
+        const y = center + i * amplitude / 2;
+        ctx.moveTo(left, y);
+        ctx.lineTo(left + span, y);
+      }
+
+      ctx.stroke();
+
+      if (!waveGradient) {
+        waveGradient = ctx.createLinearGradient(left, 0, left + span, 0);
+
+        for (let i = 0; i < COLOR_COUNT; i++) {
+          waveGradient.addColorStop(
+            i / (COLOR_COUNT - 1), colors[i]
+          );
+        }
+      }
+
+      ctx.globalCompositeOperation = "lighter";
+      ctx.lineJoin = "round";
+      ctx.lineCap = "round";
+      traceWave(left, center, span, amplitude);
+
+      ctx.strokeStyle = waveGradient;
+      ctx.shadowColor = colors[7];
+      ctx.shadowBlur = 24;
+      ctx.lineWidth = 9;
+      ctx.globalAlpha = .12;
+      ctx.stroke();
+
+      ctx.shadowBlur = 12;
+      ctx.lineWidth = 3;
+      ctx.globalAlpha = .85;
+      ctx.stroke();
+
+      ctx.shadowBlur = 0;
+      ctx.strokeStyle = "#f0fcff";
+      ctx.lineWidth = 1;
+      ctx.globalAlpha = .75;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // ============================================================
+    // Animation lifecycle — no background-tab drawing work
+    // ============================================================
+    let animationId = 0;
+
+    function render(timestamp) {
+      animationId = 0;
+      if (document.hidden) return;
+
+      const time = timestamp / 1000;
+      const dt = previousTime
+        ? Math.min(Math.max(time - previousTime, .001), .05)
+        : 1 / 60;
+
+      previousTime = time;
+
+      if ((window.devicePixelRatio || 1) !== dpr) resize();
+
+      updateColors(time);
+      readAudio(time, dt);
+
+      ctx.globalCompositeOperation = "source-over";
+      ctx.shadowBlur = 0;
+
+      const fadeRate = mode === "wave" && !reducedMotion.matches ? 8 : 25;
+      ctx.globalAlpha = clearNextFrame
+        ? 1 : 1 - Math.exp(-fadeRate * dt);
+
+      ctx.fillStyle = BG;
+      ctx.fillRect(0, 0, width, height);
+      ctx.globalAlpha = 1;
+      clearNextFrame = false;
+
+      drawDust(time, dt);
+
+      if (mode === "bars") drawBars();
+      else if (mode === "radial") drawRadial(time);
+      else drawWave();
+
+      animationId = requestAnimationFrame(render);
+    }
+
+    function startAnimation() {
+      if (!animationId && !document.hidden) {
+        previousTime = 0;
+        clearNextFrame = true;
+        animationId = requestAnimationFrame(render);
+      }
+    }
+
+    document.addEventListener("visibilitychange", () => {
+      if (document.hidden) {
+        cancelAnimationFrame(animationId);
+        animationId = 0;
+      } else {
+        updateAudioUI();
+        startAnimation();
+      }
+    });
+
+    window.addEventListener("pageshow", startAnimation);
+    window.addEventListener("resize", resize, { passive: true });
+
+    // ============================================================
+    // Controls / fullscreen / idle HUD
+    // ============================================================
+    modeButtons.forEach(button => {
+      button.addEventListener("click", () => {
+        mode = button.dataset.mode;
+
+        modeButtons.forEach(item => {
+          item.setAttribute("aria-pressed", String(item === button));
+        });
+
+        clearNextFrame = true;
+        wakeHUD();
+      });
+    });
+
+    $("#palette").addEventListener("change", event => {
+      palette = event.target.value;
+      lastColorUpdate = -Infinity;
+      clearNextFrame = true;
+
+      const accents = {
+        cyberpunk: "#59f5ff",
+        rainbow: "#b7a2ff",
+        solar: "#ffbd59",
+        toxic: "#8cff59"
+      };
+
+      document.documentElement.style.setProperty(
+        "--accent", accents[palette]
+      );
+
+      wakeHUD();
+    });
+
+    $("#gain").addEventListener("input", event => {
+      sensitivity = Number(event.target.value);
+      $("#gainValue").textContent = `${sensitivity.toFixed(1)}×`;
+      wakeHUD();
+    });
+
+    let noticeTimer = 0;
+
+    function showNotice(message) {
+      const notice = $("#notice");
+      notice.textContent = message;
+      notice.hidden = false;
+
+      clearTimeout(noticeTimer);
+      noticeTimer = setTimeout(() => {
+        notice.hidden = true;
+      }, 6500);
+    }
+
+    fullscreenButton.addEventListener("click", async () => {
+      try {
+        if (document.fullscreenElement) {
+          await document.exitFullscreen();
+        } else if (
+          document.fullscreenEnabled &&
+          document.documentElement.requestFullscreen
+        ) {
+          await document.documentElement.requestFullscreen();
+        } else {
+          showNotice(
+            "Fullscreen is not available in this browser or embedded page."
+          );
+        }
+      } catch {
+        showNotice("Fullscreen was blocked by the browser.");
+      }
+    });
+
+    document.addEventListener("fullscreenchange", () => {
+      const full = !!document.fullscreenElement;
+
+      fullscreenButton.textContent = full ? "⛶ Exit" : "⛶ Full";
+      fullscreenButton.setAttribute("aria-pressed", String(full));
+      fullscreenButton.setAttribute(
+        "aria-label", full ? "Exit fullscreen" : "Enter fullscreen"
+      );
+
+      resize();
+      wakeHUD();
+    });
+
+    let idleTimer = 0;
+    let lastPointerWake = 0;
+
+    function wakeHUD() {
+      document.body.classList.remove("idle");
+      clearTimeout(idleTimer);
+
+      idleTimer = setTimeout(() => {
+        if (session?.ready) document.body.classList.add("idle");
+      }, 2800);
+    }
+
+    window.addEventListener("pointermove", () => {
+      // Avoid constantly allocating timers at high mouse polling rates.
+      const now = performance.now();
+      if (now - lastPointerWake < 150) return;
+      lastPointerWake = now;
+      wakeHUD();
+    }, { passive: true });
+
+    window.addEventListener("pointerdown", wakeHUD, { passive: true });
+    window.addEventListener("keydown", wakeHUD);
+    hud.addEventListener("focusin", wakeHUD);
+    hud.addEventListener("pointerenter", wakeHUD);
+
+    reducedMotion.addEventListener("change", () => {
+      lastColorUpdate = -Infinity;
+      clearNextFrame = true;
+    });
+
+    // Everything is initialized before the first animation frame.
+    resize();
+    updateColors(0);
+    updateAudioUI();
+    wakeHUD();
+    startAnimation();
+  </script>
+</body>
+</html>
