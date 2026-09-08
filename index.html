@@ -1492,5 +1492,896 @@
     wakeHUD();
     startAnimation();
   </script>
+  <script>
+(() => {
+  "use strict";
+
+  /*
+   * CHROMA — Rhythm + optional HDR enhancement
+   *
+   * Requires the preceding CHROMA application script.
+   * Does not modify the microphone graph or send audio anywhere.
+   *
+   * HDR architecture:
+   * Existing Canvas 2D scene -> GPU texture -> floating-point HDR canvas.
+   *
+   * The HUD remains ordinary HTML above both canvases.
+   */
+
+  // ============================================================
+  // 1. Adaptive rhythm analysis
+  // ============================================================
+
+  const rhythm = {
+    session: null,
+    previousSpectrum: new Float32Array(0),
+
+    warmup: 0,
+    fluxMean: 0,
+    fluxVariance: 0,
+    activity: 0,
+
+    lastBeat: -Infinity,
+    intervals: [],
+    bpm: 0,
+    confidence: 0,
+
+    pulse: 0,
+    angle: 0,
+    speed: 0.025,
+
+    ripples: [],
+    time: 0
+  };
+
+  const clamp = (value, min, max) =>
+    Math.max(min, Math.min(max, value));
+
+  function resetRhythm() {
+    rhythm.session = null;
+    rhythm.previousSpectrum = new Float32Array(0);
+    rhythm.warmup = 0;
+    rhythm.fluxMean = 0;
+    rhythm.fluxVariance = 0;
+    rhythm.activity = 0;
+    rhythm.lastBeat = -Infinity;
+    rhythm.intervals.length = 0;
+    rhythm.bpm = 0;
+    rhythm.confidence = 0;
+    rhythm.pulse = 0;
+    rhythm.speed = 0.025;
+    rhythm.ripples.length = 0;
+
+    // Preserve angle so reconnecting does not abruptly rotate the scene.
+  }
+
+  function registerBeat(time, strength) {
+    const interval = time - rhythm.lastBeat;
+
+    // Estimate tempo only from plausible recurring musical intervals.
+    // Do not pretend that every isolated sound has a BPM.
+    if (Number.isFinite(interval)) {
+      if (interval >= 0.30 && interval <= 1.25) {
+        rhythm.intervals.push(interval);
+
+        if (rhythm.intervals.length > 9) {
+          rhythm.intervals.shift();
+        }
+      } else if (interval > 1.25) {
+        rhythm.intervals.length = 0;
+        rhythm.confidence = 0;
+      }
+    }
+
+    rhythm.lastBeat = time;
+    rhythm.pulse = Math.max(rhythm.pulse, strength);
+
+    if (rhythm.intervals.length >= 4) {
+      // These small allocations happen on beats, not every frame.
+      const sorted = rhythm.intervals.slice().sort((a, b) => a - b);
+      const median = sorted[Math.floor(sorted.length / 2)];
+
+      const consistent = sorted.filter(
+        value => Math.abs(value - median) < median * 0.18
+      );
+
+      const confidence = consistent.length / sorted.length;
+
+      if (confidence >= 0.65) {
+        const mean = consistent.reduce((sum, value) => sum + value, 0)
+          / consistent.length;
+
+        const estimate = 60 / mean;
+
+        rhythm.bpm = rhythm.bpm
+          ? rhythm.bpm * 0.75 + estimate * 0.25
+          : estimate;
+
+        rhythm.confidence = confidence;
+      } else {
+        rhythm.confidence *= 0.8;
+      }
+    }
+
+    // Localized ripples only; no full-screen flash.
+    if (mode === "radial" && !reducedMotion.matches) {
+      rhythm.ripples.push({
+        age: 0,
+        strength,
+        color: colors[Math.floor(Math.random() * COLOR_COUNT)]
+      });
+
+      if (rhythm.ripples.length > 6) {
+        rhythm.ripples.shift();
+      }
+    }
+  }
+
+  function updateRhythm(time, dt) {
+    rhythm.time = time;
+
+    const s = session;
+    const active = !!s?.ready &&
+      s.context.state === "running" &&
+      s.track.readyState === "live" &&
+      !s.track.muted &&
+      s.track.enabled;
+
+    if (rhythm.session !== s) {
+      resetRhythm();
+      rhythm.session = s;
+
+      if (s?.frequencyData) {
+        rhythm.previousSpectrum =
+          new Float32Array(s.frequencyData.length);
+      }
+    }
+
+    rhythm.pulse *= Math.exp(-dt * 5.5);
+
+    for (let i = rhythm.ripples.length - 1; i >= 0; i--) {
+      const ripple = rhythm.ripples[i];
+      ripple.age += dt;
+
+      if (ripple.age >= 1.6) {
+        rhythm.ripples.splice(i, 1);
+      }
+    }
+
+    if (active) {
+      const data = s.frequencyData;
+
+      if (rhythm.previousSpectrum.length !== data.length) {
+        rhythm.previousSpectrum = new Float32Array(data.length);
+        rhythm.warmup = 0;
+      }
+
+      const binHz = s.context.sampleRate / s.analyser.fftSize;
+      const first = Math.max(1, Math.floor(40 / binHz));
+      const last = Math.min(
+        data.length - 1,
+        Math.ceil(6500 / binHz)
+      );
+
+      let flux = 0;
+      let weightSum = 0;
+
+      for (let i = first; i <= last; i++) {
+        const hz = i * binHz;
+
+        // Map dB to a bounded analysis value.
+        // Keep this independent of the user's visual sensitivity slider.
+        const level = Number.isFinite(data[i])
+          ? clamp((data[i] + 90) / 70, 0, 1)
+          : 0;
+
+        const previous = rhythm.previousSpectrum[i];
+
+        // Spectral flux: count increases, not sustained loudness.
+        // Kick/bass and snare regions receive extra weight.
+        const weight = hz < 220 ? 3 : hz < 2200 ? 1.25 : 0.65;
+
+        flux += Math.max(0, level - previous) * weight;
+        weightSum += weight;
+        rhythm.previousSpectrum[i] = level;
+      }
+
+      flux /= Math.max(1, weightSum);
+
+      // Approximate refresh-rate normalization for frame-to-frame changes.
+      flux *= clamp((1 / 60) / dt, 0.4, 2);
+
+      const deviation = Math.sqrt(Math.max(0, rhythm.fluxVariance));
+
+      // Compare against the PREVIOUS adaptive baseline.
+      const threshold = Math.max(
+        0.0035,
+        rhythm.fluxMean * 1.6 + deviation * 0.7
+      );
+
+      rhythm.warmup += dt;
+
+      if (
+        rhythm.warmup > 0.8 &&
+        s.inputRms > 0.0004 &&
+        flux > threshold &&
+        time - rhythm.lastBeat > 0.29
+      ) {
+        const strength = clamp(
+          0.3 + (flux - threshold) / Math.max(threshold, 0.004) * 0.4,
+          0.3,
+          1
+        );
+
+        registerBeat(time, strength);
+      }
+
+      const follow = 1 - Math.exp(-dt * 2);
+      const delta = flux - rhythm.fluxMean;
+
+      rhythm.fluxMean += delta * follow;
+      rhythm.fluxVariance +=
+        (delta * delta - rhythm.fluxVariance) * follow;
+
+      const activityTarget = clamp(flux * 40, 0, 1);
+
+      rhythm.activity += (activityTarget - rhythm.activity)
+        * (1 - Math.exp(-dt * 3));
+    } else {
+      rhythm.activity *= Math.exp(-dt * 3);
+      rhythm.confidence *= Math.exp(-dt * 2);
+    }
+
+    // Lose confidence gracefully when the rhythm disappears.
+    if (time - rhythm.lastBeat > 2.5) {
+      rhythm.confidence *= Math.exp(-dt * 1.8);
+    }
+
+    if (time - rhythm.lastBeat > 5) {
+      rhythm.bpm = 0;
+      rhythm.intervals.length = 0;
+    }
+
+    const recentBeat = active
+      ? Math.exp(-Math.max(0, time - rhythm.lastBeat) / 1.2)
+      : 0;
+
+    const tempoFactor = rhythm.bpm
+      ? clamp((rhythm.bpm - 48) / 140, 0, 1)
+      : 0;
+
+    // Calm: slow orbit.
+    // Stable fast beats: sustained faster rotation.
+    // Isolated beats: a small, short-lived push.
+    const targetSpeed = active
+      ? 0.025
+        + tempoFactor * rhythm.confidence * recentBeat * 0.95
+        + rhythm.activity * 0.2
+        + rhythm.pulse * 0.18
+      : 0.025;
+
+    const speedResponse = targetSpeed > rhythm.speed ? 2.8 : 1.1;
+
+    rhythm.speed += (targetSpeed - rhythm.speed)
+      * (1 - Math.exp(-dt * speedResponse));
+
+    if (!reducedMotion.matches) {
+      rhythm.angle = (rhythm.angle + rhythm.speed * dt) % TAU;
+    }
+  }
+
+  // Hook the existing analysis without changing its audio handling.
+  const originalReadAudio = readAudio;
+
+  readAudio = function(time, dt) {
+    originalReadAudio(time, dt);
+    updateRhythm(time, dt);
+  };
+
+  const originalResetSignal = resetSignal;
+
+  resetSignal = function() {
+    originalResetSignal();
+    resetRhythm();
+  };
+
+  // ============================================================
+  // 2. Radial motion and beat ripples
+  // ============================================================
+
+  const originalDrawRadial = drawRadial;
+
+  drawRadial = function(time) {
+    // Original ring rotation uses time * 0.025.
+    // Supply an equivalent time derived from integrated rhythm motion.
+    const motionTime = reducedMotion.matches
+      ? time
+      : rhythm.angle / 0.025;
+
+    originalDrawRadial(motionTime);
+
+    if (reducedMotion.matches || !rhythm.ripples.length) return;
+
+    const cx = width / 2;
+    const cy = height * 0.44;
+    const size = Math.min(width, height * 0.82);
+    const baseRadius = size * 0.19;
+
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.lineWidth = 1.2;
+
+    for (const ripple of rhythm.ripples) {
+      const progress = ripple.age / 1.6;
+      const ease = 1 - Math.pow(1 - progress, 2);
+
+      const radius = baseRadius
+        + size * 0.22 * ease;
+
+      const opacity = Math.pow(1 - progress, 2)
+        * 0.28 * ripple.strength;
+
+      ctx.globalAlpha = opacity;
+      ctx.strokeStyle = ripple.color;
+      ctx.shadowColor = ripple.color;
+      ctx.shadowBlur = 12;
+
+      ctx.beginPath();
+      ctx.arc(cx, cy, radius, 0, TAU);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  };
+
+  // ============================================================
+  // 3. Optional HDR presentation canvas
+  // ============================================================
+
+  const hdrCanvas = document.createElement("canvas");
+  hdrCanvas.id = "chroma-hdr";
+  hdrCanvas.hidden = true;
+  hdrCanvas.setAttribute("aria-hidden", "true");
+
+  Object.assign(hdrCanvas.style, {
+    position: "fixed",
+    inset: "0",
+    width: "100%",
+    height: "100%",
+    zIndex: "1",
+    pointerEvents: "none",
+    background: "#0a0a0f"
+  });
+
+  // Unsupported CSS properties are safely ignored.
+  hdrCanvas.style.setProperty("dynamic-range-limit", "no-limit");
+  document.body.appendChild(hdrCanvas);
+
+  const hdrButton = document.createElement("button");
+  hdrButton.type = "button";
+  hdrButton.className = "utility";
+  hdrButton.textContent = "HDR";
+  hdrButton.setAttribute("aria-pressed", "false");
+  hdrButton.title = "Enable HDR neon highlights on a compatible display";
+
+  fullscreenButton.before(hdrButton);
+
+  const hdrDisplay = matchMedia("(dynamic-range: high)");
+
+  let gpu = null;
+  let hdrStarting = false;
+  let hdrGeneration = 0;
+
+  function updateHDRButton() {
+    hdrButton.disabled = hdrStarting;
+    hdrButton.textContent = hdrStarting
+      ? "HDR…"
+      : gpu ? "HDR On" : "HDR";
+
+    hdrButton.setAttribute("aria-pressed", String(!!gpu));
+    hdrButton.style.color = gpu ? "var(--accent)" : "";
+  }
+
+  function destroyGPU(g) {
+    if (!g) return;
+
+    try { g.context?.unconfigure(); } catch {}
+    try { g.texture?.destroy(); } catch {}
+    try { g.uniform?.destroy(); } catch {}
+    try { g.device?.destroy(); } catch {}
+  }
+
+  function disableHDR() {
+    hdrGeneration++;
+
+    const old = gpu;
+    gpu = null;
+    hdrStarting = false;
+
+    hdrCanvas.hidden = true;
+    destroyGPU(old);
+
+    updateHDRButton();
+    clearNextFrame = true;
+  }
+
+  // A real floating-point HDR output, not a CSS brightness filter.
+  const shaderCode = `
+    struct Parameters {
+      texel: vec2<f32>,
+      intensity: f32,
+      beat: f32,
+    };
+
+    @group(0) @binding(0)
+    var scene: texture_2d<f32>;
+
+    @group(0) @binding(1)
+    var sceneSampler: sampler;
+
+    @group(0) @binding(2)
+    var<uniform> params: Parameters;
+
+    struct VertexOutput {
+      @builtin(position) position: vec4<f32>,
+      @location(0) uv: vec2<f32>,
+    };
+
+    @vertex
+    fn vertexMain(
+      @builtin(vertex_index) index: u32
+    ) -> VertexOutput {
+      var positions = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0)
+      );
+
+      let p = positions[index];
+
+      var output: VertexOutput;
+      output.position = vec4<f32>(p, 0.0, 1.0);
+      output.uv = vec2<f32>(
+        p.x * 0.5 + 0.5,
+        0.5 - p.y * 0.5
+      );
+
+      return output;
+    }
+
+    // Display P3 and sRGB use the same transfer-function shape.
+    // Work in linear light for highlight and bloom calculations.
+    fn toLinear(c: vec3<f32>) -> vec3<f32> {
+      return select(
+        pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4)),
+        c / 12.92,
+        c <= vec3<f32>(0.04045)
+      );
+    }
+
+    fn toEncoded(c: vec3<f32>) -> vec3<f32> {
+      let safe = max(c, vec3<f32>(0.0));
+
+      return select(
+        1.055 * pow(safe, vec3<f32>(1.0 / 2.4)) - 0.055,
+        safe * 12.92,
+        safe <= vec3<f32>(0.0031308)
+      );
+    }
+
+    fn readScene(uv: vec2<f32>) -> vec3<f32> {
+      return toLinear(textureSample(scene, sceneSampler, uv).rgb);
+    }
+
+    fn brightPart(c: vec3<f32>) -> vec3<f32> {
+      let peak = max(max(c.r, c.g), c.b);
+      return c * smoothstep(0.35, 0.9, peak);
+    }
+
+    @fragment
+    fn fragmentMain(input: VertexOutput) -> @location(0) vec4<f32> {
+      let uv = input.uv;
+      let base = readScene(uv);
+
+      let peak = max(max(base.r, base.g), base.b);
+      let highlight = smoothstep(0.35, 0.95, peak);
+
+      // Small cross-shaped bloom kernel.
+      // The original Canvas 2D glow provides the wider soft halo.
+      let near = params.texel * 4.0;
+      let far = params.texel * 11.0;
+
+      var bloom = vec3<f32>(0.0);
+
+      bloom += brightPart(readScene(uv + vec2<f32>( near.x, 0.0)));
+      bloom += brightPart(readScene(uv + vec2<f32>(-near.x, 0.0)));
+      bloom += brightPart(readScene(uv + vec2<f32>(0.0,  near.y)));
+      bloom += brightPart(readScene(uv + vec2<f32>(0.0, -near.y)));
+
+      bloom += 0.5 * brightPart(readScene(uv + vec2<f32>( far.x, 0.0)));
+      bloom += 0.5 * brightPart(readScene(uv + vec2<f32>(-far.x, 0.0)));
+      bloom += 0.5 * brightPart(readScene(uv + vec2<f32>(0.0,  far.y)));
+      bloom += 0.5 * brightPart(readScene(uv + vec2<f32>(0.0, -far.y)));
+
+      bloom /= 6.0;
+
+      // A small artistic saturation expansion in the P3 output space.
+      // Only luminous areas are changed; the background is preserved.
+      let luma = dot(base, vec3<f32>(0.229, 0.692, 0.079));
+
+      let colorful = max(
+        mix(vec3<f32>(luma), base, 1.0 + highlight * 0.10),
+        vec3<f32>(0.0)
+      );
+
+      // Keep brightness modulation subtle and localized to highlights.
+      let gain = 1.0
+        + highlight * (params.intensity + params.beat * 0.22);
+
+      let light = colorful * gain + bloom * 0.11;
+
+      // Values above ordinary white are intentionally preserved.
+      // The browser maps them to the display's available HDR headroom.
+      return vec4<f32>(toEncoded(light), 1.0);
+    }
+  `;
+
+  async function enableHDR() {
+    if (gpu || hdrStarting) return;
+
+    if (!navigator.gpu) {
+      showNotice(
+        "This browser does not expose WebGPU. Beat effects still work. Try an up-to-date Chrome on your Mac."
+      );
+      return;
+    }
+
+    if (!hdrDisplay.matches) {
+      showNotice(
+        "The browser is not reporting an HDR-capable display. The visualizer will stay in SDR."
+      );
+      return;
+    }
+
+    hdrStarting = true;
+    updateHDRButton();
+
+    const generation = ++hdrGeneration;
+
+    const g = {
+      device: null,
+      context: null,
+      pipeline: null,
+      sampler: null,
+      uniform: null,
+      texture: null,
+      bindGroup: null,
+
+      sourceWidth: 0,
+      sourceHeight: 0,
+
+      busy: false,
+      parameters: new Float32Array(4)
+    };
+
+    try {
+      const adapter = await navigator.gpu.requestAdapter({
+        powerPreference: "high-performance"
+      });
+
+      if (!adapter) {
+        throw new Error("No suitable WebGPU adapter was found.");
+      }
+
+      if (generation !== hdrGeneration) return;
+
+      g.device = await adapter.requestDevice();
+
+      if (generation !== hdrGeneration) {
+        destroyGPU(g);
+        return;
+      }
+
+      g.context = hdrCanvas.getContext("webgpu");
+
+      if (!g.context) {
+        throw new Error("The browser could not create a WebGPU canvas.");
+      }
+
+      // Capture validation errors rather than silently showing a black canvas.
+      g.device.pushErrorScope("validation");
+
+      g.context.configure({
+        device: g.device,
+        format: "rgba16float",
+        colorSpace: "display-p3",
+        alphaMode: "opaque",
+        toneMapping: { mode: "extended" }
+      });
+
+      const configurationError = await g.device.popErrorScope();
+
+      if (configurationError) {
+        throw new Error(configurationError.message);
+      }
+
+      if (generation !== hdrGeneration) {
+        destroyGPU(g);
+        return;
+      }
+
+      // Merely accepting an unknown option is not proof of HDR support.
+      const configuration = g.context.getConfiguration?.();
+
+      if (
+        configuration?.format !== "rgba16float" ||
+        configuration?.toneMapping?.mode !== "extended"
+      ) {
+        throw new Error(
+          "This browser does not confirm support for extended HDR canvas output."
+        );
+      }
+
+      g.sampler = g.device.createSampler({
+        magFilter: "linear",
+        minFilter: "linear",
+        addressModeU: "clamp-to-edge",
+        addressModeV: "clamp-to-edge"
+      });
+
+      g.uniform = g.device.createBuffer({
+        size: 16,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST
+      });
+
+      const module = g.device.createShaderModule({
+        label: "CHROMA HDR shader",
+        code: shaderCode
+      });
+
+      g.pipeline = await g.device.createRenderPipelineAsync({
+        label: "CHROMA HDR presentation",
+        layout: "auto",
+        vertex: {
+          module,
+          entryPoint: "vertexMain"
+        },
+        fragment: {
+          module,
+          entryPoint: "fragmentMain",
+          targets: [{ format: "rgba16float" }]
+        },
+        primitive: {
+          topology: "triangle-list"
+        }
+      });
+
+      if (generation !== hdrGeneration) {
+        destroyGPU(g);
+        return;
+      }
+
+      g.device.addEventListener("uncapturederror", event => {
+        if (gpu !== g) return;
+
+        console.error("CHROMA HDR:", event.error);
+        disableHDR();
+        showNotice("HDR rendering stopped. The normal visualizer is still running.");
+      });
+
+      g.device.lost.then(info => {
+        if (gpu !== g) return;
+
+        console.warn("CHROMA GPU device lost:", info.message);
+        disableHDR();
+        showNotice("The GPU session ended. Switched back to SDR.");
+      });
+
+      gpu = g;
+      hdrStarting = false;
+      updateHDRButton();
+
+      showNotice(
+        "HDR enabled. Neon highlights use extended brightness; the controls remain SDR. Tap HDR On to compare."
+      );
+
+      // The overlay remains hidden until its first submitted frame.
+    } catch (error) {
+      destroyGPU(g);
+
+      if (generation !== hdrGeneration) return;
+
+      gpu = null;
+      hdrStarting = false;
+      hdrCanvas.hidden = true;
+      updateHDRButton();
+
+      console.warn("CHROMA HDR unavailable:", error);
+      showNotice(error.message + " The visualizer will stay in SDR.");
+    }
+  }
+
+  function prepareGPUSize(g) {
+    const sourceWidth = canvas.width;
+    const sourceHeight = canvas.height;
+    const limit = g.device.limits.maxTextureDimension2D;
+
+    if (sourceWidth > limit || sourceHeight > limit) {
+      throw new Error("The canvas is larger than this GPU can process.");
+    }
+
+    /*
+     * Limit the extra HDR presentation pass to about four million pixels.
+     * The original scene still renders at its existing Retina resolution.
+     * This keeps the additional GPU cost reasonable on a laptop.
+     */
+    const scale = Math.min(
+      1,
+      Math.sqrt(4000000 / (sourceWidth * sourceHeight))
+    );
+
+    const outputWidth = Math.max(1, Math.round(sourceWidth * scale));
+    const outputHeight = Math.max(1, Math.round(sourceHeight * scale));
+
+    if (
+      hdrCanvas.width !== outputWidth ||
+      hdrCanvas.height !== outputHeight
+    ) {
+      hdrCanvas.width = outputWidth;
+      hdrCanvas.height = outputHeight;
+    }
+
+    if (
+      g.sourceWidth === sourceWidth &&
+      g.sourceHeight === sourceHeight &&
+      g.texture
+    ) {
+      return;
+    }
+
+    g.texture?.destroy();
+
+    g.sourceWidth = sourceWidth;
+    g.sourceHeight = sourceHeight;
+
+    g.texture = g.device.createTexture({
+      label: "CHROMA source scene",
+      size: [sourceWidth, sourceHeight],
+      format: "rgba8unorm",
+      usage:
+        GPUTextureUsage.TEXTURE_BINDING |
+        GPUTextureUsage.COPY_DST |
+        GPUTextureUsage.RENDER_ATTACHMENT
+    });
+
+    g.bindGroup = g.device.createBindGroup({
+      layout: g.pipeline.getBindGroupLayout(0),
+      entries: [
+        {
+          binding: 0,
+          resource: g.texture.createView()
+        },
+        {
+          binding: 1,
+          resource: g.sampler
+        },
+        {
+          binding: 2,
+          resource: { buffer: g.uniform }
+        }
+      ]
+    });
+  }
+
+  function presentHDR() {
+    const g = gpu;
+
+    if (!g || g.busy || document.hidden) return;
+
+    try {
+      prepareGPUSize(g);
+
+      // Browser-managed conversion from the original canvas into Display P3.
+      // This is a GPU upload/copy, not a CPU getImageData pixel loop.
+      g.device.queue.copyExternalImageToTexture(
+        { source: canvas },
+        {
+          texture: g.texture,
+          colorSpace: "display-p3",
+          premultipliedAlpha: false
+        },
+        [g.sourceWidth, g.sourceHeight]
+      );
+
+      g.parameters[0] = 1 / g.sourceWidth;
+      g.parameters[1] = 1 / g.sourceHeight;
+
+      // Conservative highlight lift. This is not a requested nit value.
+      g.parameters[2] = 2.0;
+
+      // Respect reduced-motion preferences for extra brightness modulation.
+      g.parameters[3] = reducedMotion.matches ? 0 : rhythm.pulse;
+
+      g.device.queue.writeBuffer(g.uniform, 0, g.parameters);
+
+      const encoder = g.device.createCommandEncoder();
+
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [{
+          view: g.context.getCurrentTexture().createView(),
+          loadOp: "clear",
+          storeOp: "store",
+          clearValue: { r: 0, g: 0, b: 0, a: 1 }
+        }]
+      });
+
+      pass.setPipeline(g.pipeline);
+      pass.setBindGroup(0, g.bindGroup);
+      pass.draw(3);
+      pass.end();
+
+      g.device.queue.submit([encoder.finish()]);
+      hdrCanvas.hidden = false;
+
+      // Avoid building an ever-growing GPU queue on a slower device.
+      g.busy = true;
+
+      g.device.queue.onSubmittedWorkDone().then(
+        () => { g.busy = false; },
+        () => {
+          if (gpu !== g) return;
+          disableHDR();
+          showNotice("HDR rendering was interrupted. Switched back to SDR.");
+        }
+      );
+    } catch (error) {
+      console.warn("CHROMA HDR presentation:", error);
+      disableHDR();
+      showNotice("HDR could not continue. The normal visualizer is still running.");
+    }
+  }
+
+  hdrButton.addEventListener("click", () => {
+    wakeHUD();
+
+    if (gpu) {
+      disableHDR();
+    } else {
+      enableHDR();
+    }
+  });
+
+  hdrDisplay.addEventListener("change", () => {
+    if (!hdrDisplay.matches && (gpu || hdrStarting)) {
+      disableHDR();
+      showNotice("HDR is no longer available on this display. Switched to SDR.");
+    }
+  });
+
+  window.addEventListener("pagehide", disableHDR);
+
+  // ============================================================
+  // 4. Present HDR after the original scene has finished drawing
+  // ============================================================
+
+  const originalRender = render;
+
+  render = function(timestamp) {
+    originalRender(timestamp);
+
+    if (!document.hidden) {
+      presentHDR();
+    }
+  };
+
+  /*
+   * The original animation callback may already be scheduled when this
+   * script runs. Cancel it once and restart using the enhanced renderer.
+   */
+  cancelAnimationFrame(animationId);
+  animationId = 0;
+  startAnimation();
+})();
+</script>
 </body>
 </html>
