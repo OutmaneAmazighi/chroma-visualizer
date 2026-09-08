@@ -2170,7 +2170,7 @@ const shaderCode = `
 
 // Balanced default for animated neon: about one million source pixels.
 // Try 750000 for more speed, or 1600000 for more detail.
-const HDR_PIXEL_BUDGET = 1100000;
+const HDR_PIXEL_BUDGET = 750000;
 
 function prepareGPUSize(g) {
   const limit = g.device.limits.maxTextureDimension2D;
