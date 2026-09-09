@@ -4,13 +4,13 @@
   <meta charset="UTF-8">
   <meta name="viewport"
         content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="theme-color" content="#0a0a0f">
+  <meta name="theme-color" content="#000000">
   <title>CHROMA — Live Audio Visualizer</title>
 
   <style>
     :root {
       color-scheme: dark;
-      --bg: #0a0a0f;
+      --bg: #000000;
       --text: #eef2ff;
       --muted: #969bab;
       --accent: #59f5ff;
@@ -401,7 +401,7 @@
     const hud = $(".hud");
     const modeButtons = [...document.querySelectorAll("[data-mode]")];
 
-    const BG = "#0a0a0f";
+    const BG = "#000000";
     const TAU = Math.PI * 2;
     const BAND_COUNT = 72;
     const COLOR_COUNT = 24;
@@ -1850,7 +1850,7 @@
     height: "100%",
     zIndex: "1",
     pointerEvents: "none",
-    background: "#0a0a0f"
+    background: "#000000"
   });
 
   // Unsupported CSS properties are safely ignored.
