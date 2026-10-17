@@ -95,6 +95,42 @@
     .status.live .status-dot {
       background: var(--accent);
       box-shadow: 0 0 12px var(--accent);
+      transition: transform .25s ease-out;
+    }
+
+    .status.live .status-dot.beat {
+      transform: scale(1.9);
+      transition: none;
+    }
+
+    #statusText {
+      max-width: min(42vw, 360px);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    #bpm {
+      color: var(--accent);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    #bpm::before {
+      content: "· ";
+      color: var(--muted);
+    }
+
+    /* "H" hides the interface for a clean screen. */
+    .masthead, .status { transition: opacity .4s ease, visibility .4s; }
+
+    body.ui-hidden { cursor: none; }
+
+    body.ui-hidden .hud,
+    body.ui-hidden .masthead,
+    body.ui-hidden .status {
+      opacity: 0;
+      visibility: hidden;
     }
 
     .start-card {
@@ -146,6 +182,29 @@
       font-weight: 800;
     }
 
+    .sources {
+      display: flex;
+      gap: 8px;
+      margin-top: 8px;
+    }
+
+    .secondary {
+      flex: 1;
+      padding: 11px 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: #ffffff08;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 700;
+      transition: background .2s, border-color .2s;
+    }
+
+    .secondary:hover {
+      border-color: #ffffff2e;
+      background: #ffffff12;
+    }
+
     .privacy {
       display: block;
       margin-top: 16px;
@@ -177,7 +236,7 @@
       backdrop-filter: blur(24px) saturate(130%);
       -webkit-backdrop-filter: blur(24px) saturate(130%);
       box-shadow: 0 16px 60px #0007;
-      transition: opacity .6s ease, border-color .3s ease;
+      transition: opacity .6s ease, border-color .3s ease, visibility .6s;
     }
 
     body.idle .hud { opacity: .22; }
@@ -306,13 +365,15 @@
     }
 
     @media (prefers-reduced-motion: reduce) {
-      .hud, .mode, .utility { transition: none; }
+      .hud, .mode, .utility, .secondary, .masthead, .status,
+      .status.live .status-dot { transition: none; }
+      .status.live .status-dot.beat { transform: none; }
     }
   </style>
 </head>
 
 <body>
-  <canvas id="visualizer" aria-label="Live microphone audio visualizer">
+  <canvas id="visualizer" aria-label="Live audio visualizer">
     Your browser does not support the Canvas API.
   </canvas>
 
@@ -323,7 +384,8 @@
 
   <div id="status" class="status" role="status">
     <span class="status-dot" aria-hidden="true"></span>
-    <span id="statusText">Preview · mic off</span>
+    <span id="statusText">Preview · audio off</span>
+    <span id="bpm" hidden></span>
   </div>
 
   <main id="startCard" class="start-card">
@@ -331,9 +393,17 @@
     <h1>Give your sound<br>a spectrum.</h1>
     <p>Turn on your microphone and watch the room come alive in color.</p>
     <button id="startButton" class="primary" type="button">Start Mic →</button>
+    <div class="sources">
+      <button id="tabButton" class="secondary" type="button"
+              title="Visualize a browser tab, such as Spotify or YouTube">Tab audio</button>
+      <button id="fileButton" class="secondary" type="button"
+              title="Play and visualize a music file (or drop one anywhere)">Music file</button>
+    </div>
+    <input id="fileInput" type="file" accept="audio/*" hidden>
     <small class="privacy">
       Audio stays on your device.<br>
-      No recording. No uploads. No speaker feedback.
+      No recording. No uploads. No speaker feedback.<br>
+      Drop a music file anywhere · press ? for shortcuts
     </small>
     <p id="error" role="alert" hidden></p>
   </main>
@@ -393,6 +463,10 @@
 
     const startCard = $("#startCard");
     const startButton = $("#startButton");
+    const tabButton = $("#tabButton");
+    const fileButton = $("#fileButton");
+    const fileInput = $("#fileInput");
+    const sourceButtons = [startButton, tabButton, fileButton];
     const micButton = $("#micButton");
     const errorElement = $("#error");
     const statusElement = $("#status");
@@ -406,6 +480,11 @@
     const BAND_COUNT = 72;
     const COLOR_COUNT = 24;
     const WAVE_POINT_COUNT = 512;
+
+    // The fading trails were tuned on a machine drawing about 30 frames a
+    // second, and faster screens keep that look (see render). Raise this
+    // for a brighter, more washed-out picture.
+    const REFERENCE_FPS = 30;
     const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
     let width = 1;
@@ -418,13 +497,43 @@
     let waveAutoGain = 1;
     let previousTime = 0;
     let clearNextFrame = true;
+
+    // Opacity multiplier for everything drawn this frame (see render).
+    let drawGain = 1;
+    let waveClock = 0;
+    let waveDue = true;
     let lastColorUpdate = -Infinity;
 
     const bands = new Float32Array(BAND_COUNT);
     const peaks = new Float32Array(BAND_COUNT);
     const peakHold = new Float32Array(BAND_COUNT);
-    const bandStart = new Uint16Array(BAND_COUNT);
-    const bandEnd = new Uint16Array(BAND_COUNT);
+    // Each bar's frequency range in fractional FFT bins, and its level this
+    // frame in dB: bandDb is what the bar shows, bandRawDb the plain
+    // loudest bin, which the noise floor and bass pulse follow (see
+    // analyseSpectrum).
+    const bandLow = new Float32Array(BAND_COUNT);
+    const bandHigh = new Float32Array(BAND_COUNT);
+    const bandDb = new Float32Array(BAND_COUNT);
+    const bandRawDb = new Float32Array(BAND_COUNT);
+
+    // Each bar's background level in dB: hum, fans, hiss and the room's
+    // own sound as the microphone hears it. A bar lifts only for sound
+    // above its floor, so the bars rest near zero between songs and the
+    // note being played stands out (see trackNoiseFloor).
+    const NOISE = {
+      start: -90,     // dB when a source starts
+      warmRate: 40,   // dB/s the floor may climb during the first
+      warmTime: .5,   //   half second, to learn the room quickly
+      rise: 3,        // dB/s climb while a bar is near its floor
+      riseFar: .5,    // dB/s climb while far above it, so held notes stay
+      far: 8,         // dB above the floor that counts as "far"
+      fall: .5,       // s to follow the floor back down
+      ceiling: -55,   // dB; anything louder is never taken for noise
+      margin: 5,      // dB above the floor before a bar starts to lift
+      knee: 4         // dB of soft start, so quiet notes fade in
+    };
+    const noiseFloor = new Float32Array(BAND_COUNT).fill(NOISE.start);
+    let noiseClock = 0;
     const wavePoints = new Float32Array(WAVE_POINT_COUNT);
     const colors = new Array(COLOR_COUNT);
 
@@ -478,6 +587,8 @@
       wavePoints.fill(0);
       waveAutoGain = 1;
       bass = 0;
+      noiseFloor.fill(NOISE.start);
+      noiseClock = 0;
       clearNextFrame = true;
     }
 
@@ -520,13 +631,36 @@
     // Each start owns a separate session. A cancelled permission
     // request cannot attach its stream to a newer audio context.
     //
-    // Graph: microphone -> analyser
-    // No speaker output, monitor, or feedback connection.
+    // Graphs:
+    //   microphone -> analyser (no speaker output, so no feedback)
+    //   shared tab -> analyser (the tab keeps playing its own sound)
+    //   music file -> analyser, and -> speakers so it can be heard
     // ============================================================
     let session = null;
 
+    const SOURCE_NAMES = {
+      mic: "microphone",
+      tab: "tab audio",
+      file: "music file"
+    };
+
+    const STOP_LABELS = {
+      mic: "Stop mic",
+      tab: "Stop sharing",
+      file: "Stop"
+    };
+
     function isCurrent(s) {
       return session === s && !s.disposed;
+    }
+
+    // Whether the source is delivering sound right now.
+    function sourceLive(s) {
+      if (s.media) return !s.media.paused;
+
+      return s.track.readyState === "live" &&
+        !s.track.muted &&
+        s.track.enabled;
     }
 
     function disposeSession(s) {
@@ -538,8 +672,17 @@
 
       try { s.source?.disconnect(); } catch {}
       try { s.analyser?.disconnect(); } catch {}
+      try { s.barAnalyser?.disconnect(); } catch {}
 
       s.stream?.getTracks().forEach(track => track.stop());
+
+      if (s.media) {
+        s.media.pause();
+        s.media.removeAttribute("src");
+        s.media.load();
+      }
+
+      if (s.url) URL.revokeObjectURL(s.url);
 
       if (s.context && s.context.state !== "closed") {
         s.context.close().catch(() => {});
@@ -555,33 +698,54 @@
       const s = session;
       const ready = !!s?.ready;
       const running = ready && s.context.state === "running";
-      const muted = ready && (s.track.muted || !s.track.enabled);
+      const paused = ready && !!s.media?.paused;
+      const muted = ready && !s.media &&
+        (s.track.muted || !s.track.enabled);
 
-      startButton.disabled = !!s && !ready;
-      startButton.textContent = s && !ready ? "Connecting…" : "Start Mic →";
+      for (const button of sourceButtons) button.disabled = !!s && !ready;
+      startButton.textContent = s?.kind === "mic" && !ready
+        ? "Connecting…" : "Start Mic →";
       startCard.hidden = ready;
       micButton.hidden = !s;
-      statusElement.classList.toggle("live", running && !muted);
+      statusElement.classList.toggle("live", running && !paused && !muted);
 
       if (!s) {
-        statusText.textContent = "Preview · mic off";
+        statusText.textContent = "Preview · audio off";
         statusElement.title = "";
       } else if (!ready) {
-        statusText.textContent = "Connecting · microphone";
+        statusText.textContent = `Connecting · ${SOURCE_NAMES[s.kind]}`;
         micButton.textContent = "Cancel";
-      } else if (!running) {
-        statusText.textContent = "Audio paused";
-        micButton.textContent = "Resume";
+      } else if (!running || paused) {
+        statusText.textContent = `Paused · ${s.label}`;
+        micButton.textContent = s.media ? "Play" : "Resume";
       } else if (muted) {
-        statusText.textContent = "Mic temporarily muted";
-        micButton.textContent = "Stop mic";
+        statusText.textContent = `Muted · ${s.label}`;
+        micButton.textContent = STOP_LABELS[s.kind];
       } else {
-        statusText.textContent = "Live · microphone";
-        micButton.textContent = "Stop mic";
+        statusText.textContent = `Live · ${s.label}`;
+        micButton.textContent = STOP_LABELS[s.kind];
       }
     }
 
-    function friendlyAudioError(error) {
+    function friendlyAudioError(error, kind = "mic") {
+      if (kind === "tab") {
+        switch (error?.name) {
+          case "NotAllowedError":
+            return "Tab sharing was cancelled or blocked. Try again and pick the tab that is playing music.";
+          case "NotSupportedError":
+          case "TypeError":
+            return "This browser cannot share tab audio. Try Chrome, Edge or Brave on a computer.";
+          default:
+            return error?.message || "Could not share the tab’s audio. Please try again.";
+        }
+      }
+
+      if (kind === "file") {
+        return error?.name === "NotAllowedError"
+          ? "The browser blocked playback. Press Play to start the music."
+          : "This file could not be played. Try an MP3, M4A, WAV, OGG or FLAC file.";
+      }
+
       switch (error?.name) {
         case "NotAllowedError":
         case "SecurityError":
@@ -620,42 +784,158 @@
       }
     }
 
-    function configureFrequencyBands(s) {
-      const count = s.analyser.frequencyBinCount;
-      const binHz = s.context.sampleRate / s.analyser.fftSize;
-      const lowFrequency = 28;
-      const highFrequency = Math.min(17000, s.context.sampleRate / 2);
+    async function requestTabAudio() {
+      // Browsers only share audio together with a picture, so ask for
+      // both, offer tabs first, and drop the picture straight away.
+      const stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { displaySurface: "browser" },
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+          suppressLocalAudioPlayback: false
+        },
+        selfBrowserSurface: "exclude",
+        systemAudio: "include",
+        surfaceSwitching: "include"
+      });
 
-      for (let i = 0; i < BAND_COUNT; i++) {
-        const low = lowFrequency * Math.pow(
-          highFrequency / lowFrequency, i / BAND_COUNT
-        );
-        const high = lowFrequency * Math.pow(
-          highFrequency / lowFrequency, (i + 1) / BAND_COUNT
-        );
+      for (const track of stream.getVideoTracks()) {
+        track.stop();
+        stream.removeTrack(track);
+      }
 
-        const first = Math.max(
-          1, Math.min(count - 1, Math.round(low / binHz))
-        );
-
-        bandStart[i] = first;
-        bandEnd[i] = Math.min(
-          count, Math.max(first + 1, Math.round(high / binHz))
+      if (!stream.getAudioTracks().length) {
+        throw new Error(
+          "No audio was shared. Pick the tab that is playing music and keep “Share tab audio” switched on."
         );
       }
 
-      s.bassStart = Math.max(1, Math.floor(35 / binHz));
-      s.bassEnd = Math.min(count - 1, Math.ceil(180 / binHz));
+      return stream;
     }
 
-    async function startMic() {
-      if (session) return;
+    // Sets the bar edges for an analysis (see createAnalysers) and sizes
+    // the buffers analyseSpectrum works in.
+    function configureFrequencyBands(analysis) {
+      const { analyser } = analysis;
+      const count = analyser.frequencyBinCount;
+      const sampleRate = analyser.context.sampleRate;
+      const binHz = sampleRate / analyser.fftSize;
+      const lowFrequency = 28;
+      const highFrequency = Math.min(17000, sampleRate / 2);
+      const span = Math.log(highFrequency / lowFrequency);
+
+      // Bar edges stay log-spaced as before, now kept as exact fractional
+      // bins instead of rounded ones: below ~250 Hz a bar is narrower than
+      // a bin, and rounding made up to four neighbouring bars identical.
+      for (let i = 0; i < BAND_COUNT; i++) {
+        bandLow[i] = lowFrequency * Math.exp(span * i / BAND_COUNT) / binHz;
+        bandHigh[i] =
+          lowFrequency * Math.exp(span * (i + 1) / BAND_COUNT) / binHz;
+      }
+
+      // Search a few bins past the outer bars (a tone's window reach),
+      // clear of DC and Nyquist.
+      const first = Math.max(2, Math.floor(bandLow[0]) - 4);
+      const last = Math.min(
+        count - 3, Math.ceil(bandHigh[BAND_COUNT - 1]) + 4
+      );
+
+      analysis.tones = {
+        first,
+        last,
+        binHz,
+        lowFrequency,
+        span,
+        envelope: new Float32Array(count),
+        runnerUp: new Float32Array(count),
+        owner: new Int32Array(count),
+        // Only bins first..last are written each frame. At 96 kHz and up
+        // the lowest bars sit below `first`, so the rest must read as
+        // silence, not 0 dB.
+        residual: new Float32Array(count).fill(-Infinity),
+        position: new Float32Array(1024),
+        level: new Float32Array(1024),
+        bin: new Int32Array(1024)
+      };
+
+      // Bars centred between 35 and 180 Hz drive the bass pulse.
+      const centre = i =>
+        lowFrequency * Math.exp(span * (i + .5) / BAND_COUNT);
+      let bassBarStart = 0;
+      while (centre(bassBarStart) < 35) bassBarStart++;
+      let bassBarEnd = bassBarStart;
+      while (bassBarEnd + 1 < BAND_COUNT && centre(bassBarEnd + 1) <= 180) {
+        bassBarEnd++;
+      }
+
+      analysis.bassBarStart = bassBarStart;
+      analysis.bassBarEnd = bassBarEnd;
+    }
+
+    // Connects any source node (microphone, tab or file) to new analysers
+    // and returns everything readAudio needs from them. The caller stores
+    // the result on its session (see createAnalysis).
+    function createAnalysers(context, source) {
+      const analyser = context.createAnalyser();
+
+      // Higher resolution reveals more individual tones and bass detail.
+      analyser.fftSize = 4096;
+
+      // Responsive enough for transients without excessive flicker. The
+      // rhythm detector reads this analyser, so keep it as it is.
+      analyser.smoothingTimeConstant = 0.72;
+
+      // Float frequency data is mapped explicitly below, but keep these
+      // meaningful for debugging or switching to byte data.
+      analyser.minDecibels = -100;
+      analyser.maxDecibels = -20;
+
+      source.connect(analyser);
+
+      // The bars read their own analyser with lighter smoothing, so a new
+      // note takes over its bar sooner. The rhythm detector keeps the
+      // analyser above and its 0.72 smoothing.
+      const barAnalyser = context.createAnalyser();
+      barAnalyser.fftSize = analyser.fftSize;
+      barAnalyser.smoothingTimeConstant = .5;
+      barAnalyser.minDecibels = -100;
+      barAnalyser.maxDecibels = -20;
+      source.connect(barAnalyser);
+
+      const analysis = {
+        analyser,
+        frequencyData: new Float32Array(analyser.frequencyBinCount),
+        timeData: new Float32Array(analyser.fftSize),
+        barAnalyser,
+        barData: new Float32Array(barAnalyser.frequencyBinCount)
+      };
+
+      analysis.frequencyData.fill(-Infinity);
+      analysis.barData.fill(-Infinity);
+
+      configureFrequencyBands(analysis);
+      return analysis;
+    }
+
+    function createAnalysis(s) {
+      Object.assign(s, createAnalysers(s.context, s.source));
+    }
+
+    async function startSource(kind, file = null) {
+      // A new source replaces a live one, but never one still starting.
+      if (session && !session.ready) return;
+      if (session) stopSource();
 
       errorElement.hidden = true;
 
       const s = {
+        kind,
+        label: file ? file.name : SOURCE_NAMES[kind],
         context: null,
         stream: null,
+        media: null,
+        url: null,
         source: null,
         analyser: null,
         track: null,
@@ -676,15 +956,9 @@
       wakeHUD();
 
       try {
-        if (!window.isSecureContext) {
+        if (kind !== "file" && !window.isSecureContext) {
           throw new Error(
-            "Microphone access requires HTTPS or localhost. Open this page through a local web server or a secure website."
-          );
-        }
-
-        if (!navigator.mediaDevices?.getUserMedia) {
-          throw new Error(
-            "Microphone capture is unavailable in this browser or page."
+            "Microphone and tab capture require HTTPS or localhost. Open this page through a local web server or a secure website."
           );
         }
 
@@ -695,90 +969,130 @@
           throw new Error("This browser does not support Web Audio.");
         }
 
-        // Both construction and resume originate in the button gesture.
+        // Construction and resume start in the click or key press. A file
+        // chosen in a dialog or dropped can arrive without one, and then
+        // resume() would wait forever, so the Play button finishes it.
         s.context = new AudioContextClass({ latencyHint: "interactive" });
-        await s.context.resume();
+        const resumed = s.context.resume();
 
-        if (!isCurrent(s)) return;
+        // Closing the context rejects a resume that never finished.
+        resumed.catch(() => {});
 
-        // IMPORTANT: await the actual MediaStream and keep it local.
-        // Never pass a Promise, session object, or track to this API.
-        const capturedStream = await requestMicrophone();
+        if (kind === "file") {
+          s.url = URL.createObjectURL(file);
+          s.media = new Audio(s.url);
 
-        if (!isCurrent(s)) {
-          capturedStream.getTracks().forEach(track => track.stop());
-          return;
-        }
+          await new Promise((resolve, reject) => {
+            s.media.addEventListener("loadedmetadata", resolve, { once: true });
+            s.media.addEventListener(
+              "error", () => reject(s.media.error), { once: true }
+            );
+          });
 
-        if (
-          !capturedStream ||
-          typeof capturedStream.getAudioTracks !== "function"
-        ) {
-          throw new Error(
-            "The browser did not return a valid microphone MediaStream."
+          if (!isCurrent(s)) return;
+
+          s.source = s.context.createMediaElementSource(s.media);
+        } else {
+          const capture = kind === "mic" ? "getUserMedia" : "getDisplayMedia";
+
+          if (!navigator.mediaDevices?.[capture]) {
+            throw new Error(
+              kind === "mic"
+                ? "Microphone capture is unavailable in this browser or page."
+                : "This browser cannot share tab audio. Try Chrome, Edge or Brave on a computer."
+            );
+          }
+
+          await resumed;
+
+          if (!isCurrent(s)) return;
+
+          // IMPORTANT: await the actual MediaStream and keep it local.
+          // Never pass a Promise, session object, or track to this API.
+          const capturedStream = kind === "mic"
+            ? await requestMicrophone()
+            : await requestTabAudio();
+
+          if (!isCurrent(s)) {
+            capturedStream.getTracks().forEach(track => track.stop());
+            return;
+          }
+
+          if (
+            !capturedStream ||
+            typeof capturedStream.getAudioTracks !== "function"
+          ) {
+            throw new Error(
+              "The browser did not return a valid audio MediaStream."
+            );
+          }
+
+          s.stream = capturedStream;
+          s.track = capturedStream.getAudioTracks().find(
+            track => track.readyState === "live"
           );
+
+          if (!s.track) {
+            throw new Error("The audio stream has no live audio track.");
+          }
+
+          // Use the resolved MediaStream directly: this fixes the type error.
+          s.source = s.context.createMediaStreamSource(capturedStream);
         }
 
-        s.stream = capturedStream;
-        s.track = capturedStream.getAudioTracks().find(
-          track => track.readyState === "live"
-        );
-
-        if (!s.track) {
-          throw new Error("The microphone stream has no live audio track.");
-        }
-
-        s.analyser = s.context.createAnalyser();
-
-        // Higher resolution reveals more individual tones and bass detail.
-        s.analyser.fftSize = 4096;
-
-        // Responsive enough for transients without excessive flicker.
-        s.analyser.smoothingTimeConstant = 0.72;
-
-        // Float frequency data is mapped explicitly below, but keep these
-        // meaningful for debugging or switching to byte data.
-        s.analyser.minDecibels = -100;
-        s.analyser.maxDecibels = -20;
-
-        // Use the resolved MediaStream directly: this fixes the type error.
-        s.source = s.context.createMediaStreamSource(capturedStream);
-        s.source.connect(s.analyser);
-
-        // Deliberately NO connection to audioContext.destination.
-
-        s.frequencyData = new Float32Array(
-          s.analyser.frequencyBinCount
-        );
-        s.timeData = new Float32Array(s.analyser.fftSize);
-        s.frequencyData.fill(-Infinity);
-
-        configureFrequencyBands(s);
+        createAnalysis(s);
         resetSignal();
 
-        listen(s, s.track, "ended", () => {
-          if (!isCurrent(s)) return;
-          stopMic();
-          showNotice("The microphone disconnected. Press Start Mic to reconnect.");
-        });
+        if (s.media) {
+          // Unlike the microphone, a file is meant to be heard.
+          s.source.connect(s.context.destination);
 
-        listen(s, s.track, "mute", () => {
-          if (isCurrent(s)) updateAudioUI();
-        });
+          listen(s, s.media, "ended", () => {
+            if (!isCurrent(s)) return;
+            stopSource();
+            showNotice(`Finished playing ${s.label}.`);
+          });
 
-        listen(s, s.track, "unmute", () => {
-          if (!isCurrent(s)) return;
-          s.silenceTime = 0;
-          clearNextFrame = true;
-          updateAudioUI();
-        });
+          listen(s, s.media, "error", () => {
+            if (!isCurrent(s)) return;
+            stopSource();
+            showNotice(friendlyAudioError(s.media.error, "file"));
+          });
+
+          listen(s, s.media, "play", () => {
+            if (isCurrent(s)) updateAudioUI();
+          });
+
+          listen(s, s.media, "pause", () => {
+            if (isCurrent(s)) updateAudioUI();
+          });
+        } else {
+          listen(s, s.track, "ended", () => {
+            if (!isCurrent(s)) return;
+            stopSource();
+            showNotice(kind === "mic"
+              ? "The microphone disconnected. Press Start Mic to reconnect."
+              : "Tab sharing stopped.");
+          });
+
+          listen(s, s.track, "mute", () => {
+            if (isCurrent(s)) updateAudioUI();
+          });
+
+          listen(s, s.track, "unmute", () => {
+            if (!isCurrent(s)) return;
+            s.silenceTime = 0;
+            clearNextFrame = true;
+            updateAudioUI();
+          });
+        }
 
         listen(s, s.context, "statechange", () => {
           if (!isCurrent(s)) return;
 
           if (s.context.state === "closed") {
-            stopMic();
-            showNotice("The audio session closed. Press Start Mic to reconnect.");
+            stopSource();
+            showNotice("The audio session closed. Start it again to reconnect.");
           } else {
             updateAudioUI();
           }
@@ -788,30 +1102,50 @@
         updateAudioUI();
 
         // Useful diagnostics without adding anything to the visual design.
-        console.info("CHROMA microphone:", {
-          device: s.track.label,
-          settings: s.track.getSettings?.(),
+        console.info("CHROMA audio source:", {
+          kind,
+          device: s.track?.label || s.label,
+          settings: s.track?.getSettings?.(),
           sampleRate: s.context.sampleRate,
           fftSize: s.analyser.fftSize
         });
+
+        if (s.media) {
+          try {
+            await s.media.play();
+          } catch (error) {
+            if (error.name !== "NotAllowedError") throw error;
+          }
+
+          if (!isCurrent(s)) return;
+
+          // Without a click or key press the browser may hold the audio
+          // back. Wait at the start for Play rather than play silently.
+          if (s.context.state !== "running" || s.media.paused) {
+            s.media.pause();
+            showNotice("Press Play or Space to start the music.");
+          }
+
+          updateAudioUI();
+        }
 
         micButton.focus({ preventScroll: true });
       } catch (error) {
         // An older, cancelled request must not tear down a newer session.
         if (!isCurrent(s)) return;
 
-        console.error("CHROMA microphone startup:", error);
+        console.error("CHROMA audio startup:", error);
         session = null;
         disposeSession(s);
         resetSignal();
         updateAudioUI();
 
-        errorElement.textContent = friendlyAudioError(error);
+        errorElement.textContent = friendlyAudioError(error, kind);
         errorElement.hidden = false;
       }
     }
 
-    function stopMic() {
+    function stopSource() {
       const oldSession = session;
       session = null;
       disposeSession(oldSession);
@@ -820,71 +1154,322 @@
       wakeHUD();
     }
 
-    startButton.addEventListener("click", startMic);
+    async function resumeSource(s) {
+      try {
+        await s.context.resume();
+        await s.media?.play();
 
-    micButton.addEventListener("click", async () => {
+        if (isCurrent(s)) {
+          clearNextFrame = true;
+          updateAudioUI();
+        }
+      } catch (error) {
+        if (isCurrent(s)) showNotice(friendlyAudioError(error, s.kind));
+      }
+    }
+
+    // Space: start the microphone, pause or resume a file, or stop.
+    function toggleAudio() {
+      const s = session;
+
+      if (!s) {
+        startSource("mic");
+      } else if (
+        s.ready && s.media && !s.media.paused &&
+        s.context.state === "running"
+      ) {
+        s.media.pause();
+      } else {
+        micButton.click();
+      }
+    }
+
+    startButton.addEventListener("click", () => startSource("mic"));
+    tabButton.addEventListener("click", () => startSource("tab"));
+    fileButton.addEventListener("click", () => fileInput.click());
+
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files[0];
+
+      // Clear it so choosing the same file again still fires "change".
+      fileInput.value = "";
+      if (file) startSource("file", file);
+    });
+
+    tabButton.hidden = !navigator.mediaDevices?.getDisplayMedia;
+
+    function audioFileIn(dataTransfer) {
+      return [...(dataTransfer?.files || [])].find(file =>
+        file.type.startsWith("audio/") ||
+        /\.(mp3|m4a|aac|wav|ogg|oga|opus|flac|weba)$/i.test(file.name)
+      );
+    }
+
+    window.addEventListener("dragover", event => {
+      if (!event.dataTransfer?.types.includes("Files")) return;
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "copy";
+    });
+
+    window.addEventListener("drop", event => {
+      if (!event.dataTransfer?.types.includes("Files")) return;
+
+      // Without this the browser would navigate away to the file.
+      event.preventDefault();
+
+      const file = audioFileIn(event.dataTransfer);
+
+      if (file) {
+        startSource("file", file);
+      } else {
+        showNotice("That isn’t an audio file. Drop an MP3, M4A, WAV, OGG or FLAC file.");
+      }
+    });
+
+    micButton.addEventListener("click", () => {
       const s = session;
       if (!s) return;
 
-      if (!s.ready) {
-        stopMic();
-        startButton.focus({ preventScroll: true });
-        return;
-      }
-
-      if (s.context.state !== "running") {
-        try {
-          await s.context.resume();
-          if (isCurrent(s)) {
-            clearNextFrame = true;
-            updateAudioUI();
-          }
-        } catch (error) {
-          if (isCurrent(s)) showNotice(friendlyAudioError(error));
-        }
+      if (s.ready && (s.context.state !== "running" || s.media?.paused)) {
+        resumeSource(s);
       } else {
-        stopMic();
+        stopSource();
         startButton.focus({ preventScroll: true });
       }
     });
 
     // Release the microphone on navigation, including back/forward cache entry.
-    window.addEventListener("pagehide", stopMic);
+    window.addEventListener("pagehide", stopSource);
 
     // ============================================================
     // Signal processing
     // ============================================================
 
-    function spectrumLevel(db) {
+    function spectrumLevel(db, floorDb = -Infinity) {
       if (!Number.isFinite(db)) return 0;
 
       // Visual dB mapping, not a calibrated sound-pressure measurement.
-      // Peak-per-band analysis preserves narrow harmonics.
-      const normalized = Math.max(0, Math.min(1, (db + 100) / 80));
+      // Heights count from just above the bar's noise floor and reach the
+      // top at -20 dB, as before. With no floor this is the plain
+      // -100..-20 dB mapping.
+      const bottom = Math.max(-100, floorDb + NOISE.margin);
+      let excess = db - bottom;
+
+      // Soft knee: sound just above the floor fades in instead of
+      // snapping on, which keeps quiet notes and hides noise flicker.
+      if (excess < NOISE.knee) {
+        excess = excess <= -NOISE.knee
+          ? 0
+          : (excess + NOISE.knee) ** 2 / (4 * NOISE.knee);
+      }
+
+      const normalized = Math.min(1, excess / Math.max(30, -20 - bottom));
 
       // A gentle lift makes quiet spectral detail easier to see.
       // True zero stays zero; no invented live frequency activity.
       return Math.min(1, Math.pow(normalized, 0.9) * sensitivity);
     }
 
+    // Follows the quietest recent level of bar i: quickly down, slowly up,
+    // and very slowly while the bar is far above it (a held chord), so
+    // music is not mistaken for noise.
+    function trackNoiseFloor(i, db, dt, fallStep) {
+      const level = Number.isFinite(db) ? Math.max(-100, db) : -100;
+      const above = level - noiseFloor[i];
+      let floor = noiseFloor[i];
+
+      if (above < 0) {
+        floor += above * fallStep;
+      } else {
+        const rate = noiseClock < NOISE.warmTime ? NOISE.warmRate
+          : above < NOISE.far ? NOISE.rise : NOISE.riseFar;
+        floor += Math.min(above, rate * dt);
+      }
+
+      noiseFloor[i] = Math.min(floor, NOISE.ceiling);
+      return noiseFloor[i];
+    }
+
+    // ------------------------------------------------------------
+    // Note-accurate bars
+    //
+    // A pure tone never stays in one FFT bin: the analyser's Blackman
+    // window spreads it over about five bins (-4.5 dB one bin away,
+    // -20 dB two away) and the 80 dB bar scale draws those skirts at
+    // 75-95% height. In the bass, where a bar is narrower than a bin,
+    // every note lifted 8-12 bars at once.
+    //
+    // analyseSpectrum finds each tone's true frequency by parabolic
+    // interpolation (accurate to ~0.1 Hz), lifts only the bar that
+    // contains it, and drops the bins that are merely its leakage.
+    // Peaks without a tone's shape (noise, drums, chords closer than the
+    // FFT can separate) keep the ordinary per-bin display.
+    // ------------------------------------------------------------
+
+    // dB a bin may sit above a tone's leakage and still count as leakage.
+    const LEAK_MARGIN = 6;
+    // dB the bins two away from a peak may exceed a pure tone's shape.
+    const TONE_SHAPE_MARGIN = 10;
+
+    // Blackman leakage below a tone's peak (dB) by distance in 1/32 bin,
+    // with the sidelobes folded into a falling envelope.
+    const LEAK_STEPS = 32;
+    const LEAK_REACH = 24;
+    const leakDb = new Float32Array(LEAK_REACH * LEAK_STEPS + 2);
+
+    for (let t = 0; t < leakDb.length; t++) {
+      const d = t / LEAK_STEPS + 1e-7;
+      const shape = Math.sin(Math.PI * d) / Math.PI * (
+        .42 / d
+        - .25 * (1 / (d - 1) + 1 / (d + 1))
+        + .04 * (1 / (d - 2) + 1 / (d + 2))
+      );
+
+      leakDb[t] = 20 * Math.log10(Math.abs(shape) / .42 + 1e-12);
+    }
+
+    for (let t = leakDb.length - 2; t >= 0; t--) {
+      leakDb[t] = Math.max(leakDb[t], leakDb[t + 1]);
+    }
+
+    function leakAt(distance) {
+      const x = Math.abs(distance) * LEAK_STEPS;
+      const t = Math.min(x | 0, leakDb.length - 2);
+      return leakDb[t] + (leakDb[t + 1] - leakDb[t]) * (x - t);
+    }
+
+    // Fills bandDb with the loudest sound per bar and bandRawDb with the
+    // loudest bin per bar, both in dB, from one frame of spectrum data.
+    function analyseSpectrum(s, data) {
+      const tones = s.tones;
+      const { envelope, runnerUp, owner, residual } = tones;
+      const { position, level, bin, first, last } = tones;
+      let count = 0;
+
+      for (let k = first; k <= last; k++) {
+        envelope[k] = -Infinity;
+        runnerUp[k] = -Infinity;
+        owner[k] = -1;
+      }
+
+      // 1. Local maxima shaped like a pure tone.
+      for (let k = first; k <= last; k++) {
+        const peakBin = data[k];
+
+        if (
+          !(peakBin > -110) ||
+          !(peakBin > data[k - 1]) ||
+          !(peakBin >= data[k + 1])
+        ) continue;
+
+        const left = Math.max(data[k - 1], -300);
+        const right = Math.max(data[k + 1], -300);
+        const curve = left - 2 * peakBin + right;
+        const offset = curve < 0
+          ? Math.max(-.5, Math.min(.5, .5 * (left - right) / curve))
+          : 0;
+
+        const center = k + offset;
+        const peak = peakBin - .25 * (left - right) * offset;
+
+        // A tone's own leakage explains the bins two away on both sides.
+        if (
+          data[k - 2] > peak + leakAt(k - 2 - center) + TONE_SHAPE_MARGIN ||
+          data[k + 2] > peak + leakAt(k + 2 - center) + TONE_SHAPE_MARGIN
+        ) continue;
+
+        position[count] = center;
+        level[count] = peak;
+        bin[count] = k;
+
+        // Remember the strongest and second strongest leakage per bin.
+        const reach = peak > -50 ? LEAK_REACH - 1 : peak > -70 ? 12 : 4;
+        const from = Math.max(first, Math.ceil(center - reach));
+        const to = Math.min(last, Math.floor(center + reach));
+
+        for (let j = from; j <= to; j++) {
+          const leak = peak + leakAt(j - center);
+
+          if (leak > envelope[j]) {
+            runnerUp[j] = envelope[j];
+            envelope[j] = leak;
+            owner[j] = count;
+          } else if (leak > runnerUp[j]) {
+            runnerUp[j] = leak;
+          }
+        }
+
+        if (++count === position.length) break;
+      }
+
+      // 2. Bins that are not a tone's leakage keep their own level.
+      for (let k = first; k <= last; k++) {
+        residual[k] = data[k] > envelope[k] + LEAK_MARGIN
+          ? data[k] : -Infinity;
+      }
+
+      for (let i = 0; i < BAND_COUNT; i++) {
+        const low = bandLow[i];
+        const high = bandHigh[i];
+        const firstBin = Math.ceil(low);
+        const lastBin = Math.ceil(high) - 1;
+        let db = -Infinity;
+        let rawDb = -Infinity;
+
+        if (lastBin < firstBin) {
+          // Narrower than a bin: use the nearest one.
+          const k = Math.round((low + high) / 2);
+          db = residual[k];
+          rawDb = data[k];
+        } else {
+          for (let k = firstBin; k <= lastBin; k++) {
+            if (residual[k] > db) db = residual[k];
+            if (data[k] > rawDb) rawDb = data[k];
+          }
+        }
+
+        bandDb[i] = db;
+        bandRawDb[i] = rawDb;
+      }
+
+      // 3. Each tone lifts the one bar holding its frequency, unless a
+      // stronger tone's leakage explains it (a sidelobe, not a tone).
+      for (let p = 0; p < count; p++) {
+        const k = bin[p];
+        const other = owner[k] === p ? runnerUp[k] : envelope[k];
+
+        if (!(data[k] > other + LEAK_MARGIN)) continue;
+
+        const bar = Math.floor(
+          BAND_COUNT *
+          Math.log(position[p] * tones.binHz / tones.lowFrequency) /
+          tones.span
+        );
+
+        if (bar >= 0 && bar < BAND_COUNT && level[p] > bandDb[bar]) {
+          bandDb[bar] = level[p];
+        }
+      }
+    }
+
     function readAudio(time, dt) {
       const s = session;
       const active = !!s?.ready &&
         s.context.state === "running" &&
-        s.track.readyState === "live" &&
-        !s.track.muted &&
-        s.track.enabled;
+        sourceLive(s);
 
-      // Preview is shown only when microphone capture is not established.
+      // Preview is shown only when no audio source is established.
       const preview = !s?.ready;
       const attack = 1 - Math.exp(-dt * 48);
-      const release = 1 - Math.exp(-dt * 13);
+      const release = 1 - Math.exp(-dt * 18);
 
       let bassTarget = 0;
 
       if (active) {
         s.analyser.getFloatFrequencyData(s.frequencyData);
         s.analyser.getFloatTimeDomainData(s.timeData);
+        s.barAnalyser.getFloatFrequencyData(s.barData);
+        analyseSpectrum(s, s.barData);
 
         let squareSum = 0;
         let peak = 0;
@@ -918,22 +1503,11 @@
         waveAutoGain += (desiredGain - waveAutoGain)
           * (1 - Math.exp(-dt * gainRate));
 
-        let bassSum = 0;
-        let bassPeak = 0;
-
-        for (let i = s.bassStart; i <= s.bassEnd; i++) {
-          const level = spectrumLevel(s.frequencyData[i]);
-          bassSum += level;
-          bassPeak = Math.max(bassPeak, level);
-        }
-
-        const bassAverage = bassSum / (s.bassEnd - s.bassStart + 1);
-        bassTarget = bassAverage * .65 + bassPeak * .35;
-
         // Detect essentially digital silence, not merely a quiet room.
         s.silenceTime = peak < 0.00001 ? s.silenceTime + dt : 0;
 
-        if (s.silenceTime > 7 && !s.silenceNotified) {
+        // A quiet tab or file is normal; a dead microphone is not.
+        if (s.kind === "mic" && s.silenceTime > 7 && !s.silenceNotified) {
           s.silenceNotified = true;
           showNotice(
             "The microphone is connected but sending almost no signal. Check the selected browser input and your system’s microphone level."
@@ -944,24 +1518,38 @@
           s.lastTelemetry = time;
           const db = 20 * Math.log10(Math.max(rms, 1e-8));
           statusElement.title =
-            `${s.track.label || "Microphone"} · RMS ${db.toFixed(1)} dBFS` +
+            `${s.track?.label || s.label} · RMS ${db.toFixed(1)} dBFS` +
             (peak >= .99 ? " · Input may be clipping" : "");
         }
       } else {
         waveAutoGain = 1;
       }
 
+      const fallStep = 1 - Math.exp(-dt / NOISE.fall);
+      let bassSum = 0;
+      let bassPeak = 0;
+
+      if (active) noiseClock += dt;
+
       for (let i = 0; i < BAND_COUNT; i++) {
         let target = 0;
 
         if (active) {
-          let strongestDb = -Infinity;
+          // The floor follows everything the bar hears, including a tone
+          // that analyseSpectrum moved into it, but not the empty bars
+          // beside a tone, whose noise is only hidden for a moment.
+          const floor = trackNoiseFloor(
+            i, Math.max(bandRawDb[i], bandDb[i]), dt, fallStep
+          );
 
-          for (let bin = bandStart[i]; bin < bandEnd[i]; bin++) {
-            strongestDb = Math.max(strongestDb, s.frequencyData[bin]);
+          target = spectrumLevel(bandDb[i], floor);
+
+          // The bass pulse keeps the full width of a kick or bass note.
+          if (i >= s.bassBarStart && i <= s.bassBarEnd) {
+            const level = spectrumLevel(bandRawDb[i], floor);
+            bassSum += level;
+            bassPeak = Math.max(bassPeak, level);
           }
-
-          target = spectrumLevel(strongestDb);
         } else if (preview) {
           const t = reducedMotion.matches ? 0 : time;
 
@@ -985,6 +1573,11 @@
             peaks[i] = Math.max(bands[i], peaks[i] - dt * .3);
           }
         }
+      }
+
+      if (active) {
+        const bassAverage = bassSum / (s.bassBarEnd - s.bassBarStart + 1);
+        bassTarget = bassAverage * .65 + bassPeak * .35;
       }
 
       bass += (bassTarget - bass)
@@ -1068,19 +1661,37 @@
       const w = Math.max(1, Math.ceil(canvas.width / GLOW_DOWNSCALE));
       const h = Math.max(1, Math.ceil(canvas.height / GLOW_DOWNSCALE));
 
-      if (glowCanvas.width !== w || glowCanvas.height !== h) {
-        glowCanvas.width = blurCanvas.width = w;
-        glowCanvas.height = blurCanvas.height = h;
+      // Strokes are drawn at twice the blur layer's resolution and averaged
+      // down 2:1 when blurred. Drawn directly at 1/4, thin moving strokes
+      // made the glow crawl. Both sizes are checked: a fresh canvas is
+      // 300x150, which can coincide with the blur layer's target size.
+      if (
+        blurCanvas.width !== w || blurCanvas.height !== h ||
+        glowCanvas.width !== w * 2 || glowCanvas.height !== h * 2
+      ) {
+        blurCanvas.width = w;
+        blurCanvas.height = h;
+        glowCanvas.width = w * 2;
+        glowCanvas.height = h * 2;
       }
 
       // Drawing coordinates stay in CSS pixels, as in the scene canvas.
-      glowCtx.setTransform(w / width, 0, 0, h / height, 0, 0);
+      glowCtx.setTransform(w * 2 / width, 0, 0, h * 2 / height, 0, 0);
       glowCtx.globalCompositeOperation = "lighter";
       glowCtx.lineCap = "round";
       glowCtx.lineJoin = "round";
     }
 
     function glowStroke(path, color, alpha, lineWidth) {
+      // GPUs draw strokes thinner than a layer pixel unevenly (beaded
+      // rings). Widen them to one pixel, dimmed to keep the same light.
+      const minWidth = width / glowCanvas.width;
+
+      if (lineWidth < minWidth) {
+        alpha *= lineWidth / minWidth;
+        lineWidth = minWidth;
+      }
+
       glowCtx.strokeStyle = color;
       glowCtx.globalAlpha = alpha;
       glowCtx.lineWidth = lineWidth;
@@ -1090,20 +1701,20 @@
     // Blurs everything stroked since the last flush and adds it to the
     // scene. `blur` is the old shadowBlur value, in scene canvas pixels.
     // x, y, w, h bound the strokes in CSS pixels, so only that area is
-    // blurred and composited.
-    function flushGlow(blur, x, y, w, h) {
+    // blurred and composited. `gain` scales the glow's opacity.
+    function flushGlow(blur, x, y, w, h, gain = drawGain) {
       const sigma = blur / 2 / GLOW_DOWNSCALE;
       const pad = Math.ceil(sigma * 3) + 1;
-      const scaleX = glowCanvas.width / width;
-      const scaleY = glowCanvas.height / height;
+      const scaleX = blurCanvas.width / width;
+      const scaleY = blurCanvas.height / height;
 
       const left = Math.max(0, Math.floor(x * scaleX) - pad);
       const top = Math.max(0, Math.floor(y * scaleY) - pad);
       const right = Math.min(
-        glowCanvas.width, Math.ceil((x + w) * scaleX) + pad
+        blurCanvas.width, Math.ceil((x + w) * scaleX) + pad
       );
       const bottom = Math.min(
-        glowCanvas.height, Math.ceil((y + h) * scaleY) + pad
+        blurCanvas.height, Math.ceil((y + h) * scaleY) + pad
       );
 
       if (right > left && bottom > top) {
@@ -1111,15 +1722,17 @@
         const sh = bottom - top;
 
         // Clear all of it: scaling samples just past the copied area.
+        // The exact 2:1 downscale averages each 2x2 block of strokes.
         blurCtx.clearRect(0, 0, blurCanvas.width, blurCanvas.height);
         blurCtx.filter = `blur(${sigma}px)`;
         blurCtx.drawImage(
-          glowCanvas, left, top, sw, sh, left, top, sw, sh
+          glowCanvas, left * 2, top * 2, sw * 2, sh * 2,
+          left, top, sw, sh
         );
 
         ctx.save();
         ctx.globalCompositeOperation = "lighter";
-        ctx.globalAlpha = 1;
+        ctx.globalAlpha = gain;
         ctx.drawImage(
           blurCanvas, left, top, sw, sh,
           left / scaleX, top / scaleY, sw / scaleX, sh / scaleY
@@ -1149,8 +1762,8 @@
         const drift = reducedMotion.matches
           ? 0 : Math.sin(t * .15 + particle.phase) * 12;
 
-        ctx.globalAlpha =
-          .11 + (Math.sin(particle.phase + t * .35) + 1) * .07;
+        ctx.globalAlpha = drawGain *
+          (.11 + (Math.sin(particle.phase + t * .35) + 1) * .07);
 
         ctx.beginPath();
         ctx.arc(
@@ -1194,12 +1807,12 @@
 
         ctx.strokeStyle = colors[c];
         ctx.lineWidth = barWidth;
-        ctx.globalAlpha = .82;
+        ctx.globalAlpha = .82 * drawGain;
         ctx.stroke(path);
         glowStroke(path, colors[c], .82, barWidth);
 
         ctx.lineWidth = Math.max(1, barWidth * .3);
-        ctx.globalAlpha = .5;
+        ctx.globalAlpha = .5 * drawGain;
         ctx.stroke(path);
       }
 
@@ -1209,7 +1822,7 @@
         availableWidth, barWidth + tallest
       );
 
-      ctx.globalAlpha = .8;
+      ctx.globalAlpha = .8 * drawGain;
 
       for (let i = 0; i < BAND_COUNT; i++) {
         const x = left + (i + .5) * step;
@@ -1219,7 +1832,7 @@
         ctx.fillRect(x - barWidth / 2, y, barWidth, 2);
       }
 
-      ctx.globalAlpha = .1;
+      ctx.globalAlpha = .1 * drawGain;
       ctx.strokeStyle = colors[0];
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -1270,7 +1883,7 @@
         }
 
         ctx.strokeStyle = colors[c];
-        ctx.globalAlpha = .9;
+        ctx.globalAlpha = .9 * drawGain;
         ctx.stroke(path);
         glowStroke(path, colors[c], .9, lineWidth);
       }
@@ -1284,16 +1897,17 @@
 
       ctx.strokeStyle = colors[0];
       ctx.lineWidth = 1.5;
-      ctx.globalAlpha = .4 + bass * .5;
+      const ringAlpha = .4 + bass * .5;
+      ctx.globalAlpha = ringAlpha * drawGain;
       ctx.stroke(ring);
-      glowStroke(ring, colors[0], ctx.globalAlpha, 1.5);
+      glowStroke(ring, colors[0], ringAlpha, 1.5);
       flushGlow(
         20 + bass * 16,
         cx - ringRadius - 1, cy - ringRadius - 1,
         ringRadius * 2 + 2, ringRadius * 2 + 2
       );
 
-      ctx.globalAlpha = .13;
+      ctx.globalAlpha = .13 * drawGain;
       ctx.lineWidth = 1;
 
       ctx.beginPath();
@@ -1312,7 +1926,7 @@
       }
 
       ctx.fillStyle = coreGradient;
-      ctx.globalAlpha = .035 + bass * .13;
+      ctx.globalAlpha = (.035 + bass * .13) * drawGain;
       ctx.beginPath();
       ctx.arc(0, 0, 1, 0, TAU);
       ctx.fill();
@@ -1353,7 +1967,7 @@
 
       ctx.save();
       ctx.strokeStyle = "#8090b8";
-      ctx.globalAlpha = .055;
+      ctx.globalAlpha = .055 * drawGain;
       ctx.lineWidth = 1;
       ctx.beginPath();
 
@@ -1381,6 +1995,12 @@
         }
       }
 
+      // Snapshots are drawn at full strength, but only when one is due.
+      if (!waveDue) {
+        ctx.restore();
+        return;
+      }
+
       ctx.globalCompositeOperation = "lighter";
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
@@ -1396,13 +2016,13 @@
       ctx.globalAlpha = .12;
       ctx.stroke(path);
       glowStroke(path, colors[7], .12, 9);
-      flushGlow(24, left - 5, top, span + 10, traceHeight);
+      flushGlow(24, left - 5, top, span + 10, traceHeight, 1);
 
       ctx.lineWidth = 3;
       ctx.globalAlpha = .85;
       ctx.stroke(path);
       glowStroke(path, colors[7], .85, 3);
-      flushGlow(12, left - 5, top, span + 10, traceHeight);
+      flushGlow(12, left - 5, top, span + 10, traceHeight, 1);
 
       ctx.strokeStyle = "#f0fcff";
       ctx.lineWidth = 1;
@@ -1436,8 +2056,34 @@
       ctx.shadowBlur = 0;
 
       const fadeRate = mode === "wave" && !reducedMotion.matches ? 8 : 25;
-      ctx.globalAlpha = clearNextFrame
-        ? 1 : 1 - Math.exp(-fadeRate * dt);
+
+      // Rounded to the 8-bit alpha a software canvas applies, so the gain
+      // below matches the fade that really happens (GPUs differ by <1%).
+      const fade = Math.max(
+        1, Math.round(255 * (1 - Math.exp(-fadeRate * dt)))
+      ) / 255;
+      const referenceFade = Math.round(
+        255 * (1 - Math.exp(-fadeRate / REFERENCE_FPS))
+      ) / 255;
+
+      // Each frame adds light on top of the fading trail, so a fixed amount
+      // per frame made the picture brighter, whiter and smearier the higher
+      // the refresh rate. Scale it so every refresh rate settles where
+      // REFERENCE_FPS does. Slower frame rates keep full opacity.
+      drawGain = clearNextFrame ? 1 : Math.min(1, fade / referenceFade);
+
+      // A wave is a new snapshot every frame, so fast screens filled its
+      // trail with dozens of dim copies. Draw one at most REFERENCE_FPS
+      // times a second instead, at full strength.
+      const waveInterval = 1 / REFERENCE_FPS;
+      waveClock += dt;
+      waveDue = clearNextFrame || waveClock >= waveInterval;
+
+      if (waveDue) {
+        waveClock = Math.min(Math.max(0, waveClock - waveInterval), waveInterval);
+      }
+
+      ctx.globalAlpha = clearNextFrame ? 1 : fade;
 
       ctx.fillStyle = BG;
       ctx.fillRect(0, 0, width, height);
@@ -1477,43 +2123,91 @@
     // ============================================================
     // Controls / fullscreen / idle HUD
     // ============================================================
+    const paletteSelect = $("#palette");
+    const gainInput = $("#gain");
+    const MODES = modeButtons.map(button => button.dataset.mode);
+
+    const ACCENTS = {
+      cyberpunk: "#59f5ff",
+      rainbow: "#b7a2ff",
+      solar: "#ffbd59",
+      toxic: "#8cff59"
+    };
+
+    const PALETTES = Object.keys(ACCENTS);
+
+    function setMode(next) {
+      mode = next;
+
+      modeButtons.forEach(item => {
+        item.setAttribute("aria-pressed", String(item.dataset.mode === next));
+      });
+
+      clearNextFrame = true;
+      saveSettings();
+    }
+
+    function setPalette(next) {
+      palette = next;
+      paletteSelect.value = next;
+      lastColorUpdate = -Infinity;
+      clearNextFrame = true;
+
+      document.documentElement.style.setProperty(
+        "--accent", ACCENTS[palette]
+      );
+
+      saveSettings();
+    }
+
+    function setSensitivity(value) {
+      sensitivity = Math.min(4, Math.max(0.2, Math.round(value * 10) / 10));
+      gainInput.value = sensitivity;
+      $("#gainValue").textContent = `${sensitivity.toFixed(1)}×`;
+      saveSettings();
+    }
+
     modeButtons.forEach(button => {
       button.addEventListener("click", () => {
-        mode = button.dataset.mode;
-
-        modeButtons.forEach(item => {
-          item.setAttribute("aria-pressed", String(item === button));
-        });
-
-        clearNextFrame = true;
+        setMode(button.dataset.mode);
         wakeHUD();
       });
     });
 
-    $("#palette").addEventListener("change", event => {
-      palette = event.target.value;
-      lastColorUpdate = -Infinity;
-      clearNextFrame = true;
-
-      const accents = {
-        cyberpunk: "#59f5ff",
-        rainbow: "#b7a2ff",
-        solar: "#ffbd59",
-        toxic: "#8cff59"
-      };
-
-      document.documentElement.style.setProperty(
-        "--accent", accents[palette]
-      );
-
+    paletteSelect.addEventListener("change", event => {
+      setPalette(event.target.value);
       wakeHUD();
     });
 
-    $("#gain").addEventListener("input", event => {
-      sensitivity = Number(event.target.value);
-      $("#gainValue").textContent = `${sensitivity.toFixed(1)}×`;
+    gainInput.addEventListener("input", event => {
+      setSensitivity(Number(event.target.value));
       wakeHUD();
     });
+
+    // Mode, palette and sensitivity survive a reload. Storage can be
+    // unavailable (private windows, blocked site data), which is fine.
+    const SETTINGS_KEY = "chroma-settings";
+
+    function saveSettings() {
+      try {
+        localStorage.setItem(
+          SETTINGS_KEY, JSON.stringify({ mode, palette, sensitivity })
+        );
+      } catch {}
+    }
+
+    function loadSettings() {
+      let saved = null;
+
+      try {
+        saved = JSON.parse(localStorage.getItem(SETTINGS_KEY));
+      } catch {}
+
+      if (!saved) return;
+      if (MODES.includes(saved.mode)) setMode(saved.mode);
+      if (PALETTES.includes(saved.palette)) setPalette(saved.palette);
+      if (Number.isFinite(saved.sensitivity)) setSensitivity(saved.sensitivity);
+    }
 
     let noticeTimer = 0;
 
@@ -1590,7 +2284,74 @@
       clearNextFrame = true;
     });
 
+    // ============================================================
+    // Keyboard shortcuts
+    // ============================================================
+    const SHORTCUTS =
+      "Keys: 1–3 mode · P palette · ↑ ↓ sensitivity · F fullscreen · " +
+      "H hide controls · Space start, pause or stop";
+
+    function toggleInterface() {
+      const hidden = document.body.classList.toggle("ui-hidden");
+
+      // Focus must not stay on a control that can no longer be seen.
+      if (hidden && hud.contains(document.activeElement)) {
+        document.activeElement.blur();
+      }
+
+      showNotice(hidden ? "Controls hidden · press H to show them" : SHORTCUTS);
+    }
+
+    window.addEventListener("keydown", event => {
+      if (event.ctrlKey || event.metaKey || event.altKey) return;
+
+      // Leave typing, the slider's own arrow keys and pressing a focused
+      // button with Space to the browser.
+      const target = event.target;
+      if (target.closest?.("input, select, textarea")) return;
+      if (event.key === " " && target.closest?.("button")) return;
+
+      switch (event.key) {
+        case "1":
+        case "2":
+        case "3":
+          setMode(MODES[Number(event.key) - 1]);
+          break;
+        case "p":
+        case "P": {
+          const step = event.shiftKey ? PALETTES.length - 1 : 1;
+          setPalette(PALETTES[(PALETTES.indexOf(palette) + step) % PALETTES.length]);
+          showNotice(paletteSelect.selectedOptions[0].textContent);
+          break;
+        }
+        case "ArrowUp":
+        case "ArrowDown":
+          setSensitivity(sensitivity + (event.key === "ArrowUp" ? .1 : -.1));
+          showNotice(`Sensitivity ${sensitivity.toFixed(1)}×`);
+          break;
+        case "f":
+        case "F":
+          if (!event.repeat) fullscreenButton.click();
+          break;
+        case "h":
+        case "H":
+          if (!event.repeat) toggleInterface();
+          break;
+        case " ":
+          if (!event.repeat) toggleAudio();
+          break;
+        case "?":
+          showNotice(SHORTCUTS);
+          break;
+        default:
+          return;
+      }
+
+      event.preventDefault();
+    });
+
     // Everything is initialized before the first animation frame.
+    loadSettings();
     resize();
     updateColors(0);
     updateAudioUI();
@@ -1605,7 +2366,7 @@
    * CHROMA — Rhythm + optional HDR enhancement
    *
    * Requires the preceding CHROMA application script.
-   * Does not modify the microphone graph or send audio anywhere.
+   * Does not modify the audio graph or send audio anywhere.
    *
    * HDR architecture:
    * Existing Canvas 2D scene -> GPU texture -> floating-point HDR canvas.
@@ -1641,6 +2402,22 @@
 
   const clamp = (value, min, max) =>
     Math.max(min, Math.min(max, value));
+
+  // BPM readout and beat pulse in the status corner.
+  const bpmElement = document.getElementById("bpm");
+  const statusDot = document.querySelector(".status-dot");
+  let lastBpmUpdate = -Infinity;
+  let beatPulseTimer = 0;
+
+  function updateBpmReadout(time, active) {
+    if (time - lastBpmUpdate < 0.5) return;
+    lastBpmUpdate = time;
+
+    // Only a steady, recurring beat earns a number.
+    const show = active && rhythm.bpm > 0 && rhythm.confidence >= 0.5;
+    bpmElement.hidden = !show;
+    if (show) bpmElement.textContent = `${Math.round(rhythm.bpm)} BPM`;
+  }
 
   function resetRhythm() {
     rhythm.session = null;
@@ -1680,6 +2457,10 @@
 
     rhythm.lastBeat = time;
     rhythm.pulse = Math.max(rhythm.pulse, strength);
+
+    statusDot.classList.add("beat");
+    clearTimeout(beatPulseTimer);
+    beatPulseTimer = setTimeout(() => statusDot.classList.remove("beat"), 90);
 
     if (rhythm.intervals.length >= 4) {
       // These small allocations happen on beats, not every frame.
@@ -1728,9 +2509,7 @@
     const s = session;
     const active = !!s?.ready &&
       s.context.state === "running" &&
-      s.track.readyState === "live" &&
-      !s.track.muted &&
-      s.track.enabled;
+      sourceLive(s);
 
     if (rhythm.session !== s) {
       resetRhythm();
@@ -1873,6 +2652,8 @@
     if (!reducedMotion.matches) {
       rhythm.angle = (rhythm.angle + rhythm.speed * dt) % TAU;
     }
+
+    updateBpmReadout(time, active);
   }
 
   // Hook the existing analysis without changing its audio handling.
@@ -1930,7 +2711,7 @@
       const path = new Path2D();
       path.arc(cx, cy, radius, 0, TAU);
 
-      ctx.globalAlpha = opacity;
+      ctx.globalAlpha = opacity * drawGain;
       ctx.strokeStyle = ripple.color;
       ctx.stroke(path);
       glowStroke(path, ripple.color, opacity, 1.2);
