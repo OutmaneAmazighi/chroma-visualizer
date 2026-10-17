@@ -1052,6 +1052,87 @@
     // ============================================================
     // Rendering — original CHROMA visual language
     // ============================================================
+
+    // Neon glow: glowing strokes are also drawn into a small offscreen
+    // layer that is blurred once and added back. Per-stroke shadowBlur
+    // ran a full-resolution blur for every color group on every frame,
+    // which saturated the GPU and made the whole browser stutter.
+    const GLOW_DOWNSCALE = 4;
+    const glowCanvas = document.createElement("canvas");
+    const glowCtx = glowCanvas.getContext("2d");
+    const blurCanvas = document.createElement("canvas");
+    const blurCtx = blurCanvas.getContext("2d");
+
+    function beginGlow() {
+      // Follows the scene canvas, whose size also changes in HDR mode.
+      const w = Math.max(1, Math.ceil(canvas.width / GLOW_DOWNSCALE));
+      const h = Math.max(1, Math.ceil(canvas.height / GLOW_DOWNSCALE));
+
+      if (glowCanvas.width !== w || glowCanvas.height !== h) {
+        glowCanvas.width = blurCanvas.width = w;
+        glowCanvas.height = blurCanvas.height = h;
+      }
+
+      // Drawing coordinates stay in CSS pixels, as in the scene canvas.
+      glowCtx.setTransform(w / width, 0, 0, h / height, 0, 0);
+      glowCtx.globalCompositeOperation = "lighter";
+      glowCtx.lineCap = "round";
+      glowCtx.lineJoin = "round";
+    }
+
+    function glowStroke(path, color, alpha, lineWidth) {
+      glowCtx.strokeStyle = color;
+      glowCtx.globalAlpha = alpha;
+      glowCtx.lineWidth = lineWidth;
+      glowCtx.stroke(path);
+    }
+
+    // Blurs everything stroked since the last flush and adds it to the
+    // scene. `blur` is the old shadowBlur value, in scene canvas pixels.
+    // x, y, w, h bound the strokes in CSS pixels, so only that area is
+    // blurred and composited.
+    function flushGlow(blur, x, y, w, h) {
+      const sigma = blur / 2 / GLOW_DOWNSCALE;
+      const pad = Math.ceil(sigma * 3) + 1;
+      const scaleX = glowCanvas.width / width;
+      const scaleY = glowCanvas.height / height;
+
+      const left = Math.max(0, Math.floor(x * scaleX) - pad);
+      const top = Math.max(0, Math.floor(y * scaleY) - pad);
+      const right = Math.min(
+        glowCanvas.width, Math.ceil((x + w) * scaleX) + pad
+      );
+      const bottom = Math.min(
+        glowCanvas.height, Math.ceil((y + h) * scaleY) + pad
+      );
+
+      if (right > left && bottom > top) {
+        const sw = right - left;
+        const sh = bottom - top;
+
+        // Clear all of it: scaling samples just past the copied area.
+        blurCtx.clearRect(0, 0, blurCanvas.width, blurCanvas.height);
+        blurCtx.filter = `blur(${sigma}px)`;
+        blurCtx.drawImage(
+          glowCanvas, left, top, sw, sh, left, top, sw, sh
+        );
+
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
+        ctx.globalAlpha = 1;
+        ctx.drawImage(
+          blurCanvas, left, top, sw, sh,
+          left / scaleX, top / scaleY, sw / scaleX, sh / scaleY
+        );
+        ctx.restore();
+      }
+
+      glowCtx.save();
+      glowCtx.setTransform(1, 0, 0, 1, 0, 0);
+      glowCtx.clearRect(0, 0, glowCanvas.width, glowCanvas.height);
+      glowCtx.restore();
+    }
+
     function drawDust(time, dt) {
       const t = reducedMotion.matches ? 0 : time;
 
@@ -1095,30 +1176,38 @@
       ctx.save();
       ctx.globalCompositeOperation = "lighter";
       ctx.lineCap = "round";
+      beginGlow();
+
+      let tallest = 0;
 
       for (let c = 0; c < COLOR_COUNT; c++) {
-        ctx.beginPath();
+        const path = new Path2D();
 
         for (const i of colorGroups[c]) {
           const x = left + (i + .5) * step;
           const barHeight = Math.max(1, bands[i] * maxHeight);
+          tallest = Math.max(tallest, barHeight);
 
-          ctx.moveTo(x, baseline - barWidth / 2);
-          ctx.lineTo(x, baseline - barWidth / 2 - barHeight);
+          path.moveTo(x, baseline - barWidth / 2);
+          path.lineTo(x, baseline - barWidth / 2 - barHeight);
         }
 
         ctx.strokeStyle = colors[c];
-        ctx.shadowColor = colors[c];
-        ctx.shadowBlur = 14;
         ctx.lineWidth = barWidth;
         ctx.globalAlpha = .82;
-        ctx.stroke();
+        ctx.stroke(path);
+        glowStroke(path, colors[c], .82, barWidth);
 
-        ctx.shadowBlur = 0;
         ctx.lineWidth = Math.max(1, barWidth * .3);
         ctx.globalAlpha = .5;
-        ctx.stroke();
+        ctx.stroke(path);
       }
+
+      flushGlow(
+        14,
+        left, baseline - barWidth - tallest,
+        availableWidth, barWidth + tallest
+      );
 
       ctx.globalAlpha = .8;
 
@@ -1148,13 +1237,16 @@
       const extension = size * .18;
       const rotation = reducedMotion.matches ? 0 : time * .025;
 
+      const lineWidth = Math.max(2, Math.min(7, size * .008));
+
       ctx.save();
       ctx.globalCompositeOperation = "lighter";
       ctx.lineCap = "round";
-      ctx.lineWidth = Math.max(2, Math.min(7, size * .008));
+      ctx.lineWidth = lineWidth;
+      beginGlow();
 
       for (let c = 0; c < COLOR_COUNT; c++) {
-        ctx.beginPath();
+        const path = new Path2D();
 
         for (const i of colorGroups[c]) {
           const angle = i / BAND_COUNT * TAU - Math.PI / 2 + rotation;
@@ -1170,31 +1262,37 @@
           const cos = Math.cos(angle);
           const sin = Math.sin(angle);
 
-          ctx.moveTo(cx + cos * radius, cy + sin * radius);
-          ctx.lineTo(
+          path.moveTo(cx + cos * radius, cy + sin * radius);
+          path.lineTo(
             cx + cos * (radius + length),
             cy + sin * (radius + length)
           );
         }
 
         ctx.strokeStyle = colors[c];
-        ctx.shadowColor = colors[c];
-        ctx.shadowBlur = 15;
         ctx.globalAlpha = .9;
-        ctx.stroke();
+        ctx.stroke(path);
+        glowStroke(path, colors[c], .9, lineWidth);
       }
 
-      ctx.shadowColor = colors[0];
+      const outer = radius + 3 + extension + lineWidth;
+      flushGlow(15, cx - outer, cy - outer, outer * 2, outer * 2);
+
+      const ringRadius = Math.max(1, radius - 9);
+      const ring = new Path2D();
+      ring.arc(cx, cy, ringRadius, 0, TAU);
+
       ctx.strokeStyle = colors[0];
-      ctx.shadowBlur = 20 + bass * 16;
       ctx.lineWidth = 1.5;
       ctx.globalAlpha = .4 + bass * .5;
+      ctx.stroke(ring);
+      glowStroke(ring, colors[0], ctx.globalAlpha, 1.5);
+      flushGlow(
+        20 + bass * 16,
+        cx - ringRadius - 1, cy - ringRadius - 1,
+        ringRadius * 2 + 2, ringRadius * 2 + 2
+      );
 
-      ctx.beginPath();
-      ctx.arc(cx, cy, Math.max(1, radius - 9), 0, TAU);
-      ctx.stroke();
-
-      ctx.shadowBlur = 0;
       ctx.globalAlpha = .13;
       ctx.lineWidth = 1;
 
@@ -1223,26 +1321,28 @@
 
     function traceWave(left, center, span, amplitude) {
       const step = span / (WAVE_POINT_COUNT - 1);
+      const path = new Path2D();
 
-      ctx.beginPath();
-      ctx.moveTo(left, center + wavePoints[0] * amplitude);
+      path.moveTo(left, center + wavePoints[0] * amplitude);
 
       for (let i = 1; i < WAVE_POINT_COUNT - 1; i++) {
         const x = left + i * step;
         const y = center + wavePoints[i] * amplitude;
         const nextY = center + wavePoints[i + 1] * amplitude;
 
-        ctx.quadraticCurveTo(
+        path.quadraticCurveTo(
           x, y,
           x + step / 2,
           (y + nextY) / 2
         );
       }
 
-      ctx.lineTo(
+      path.lineTo(
         left + span,
         center + wavePoints[WAVE_POINT_COUNT - 1] * amplitude
       );
+
+      return path;
     }
 
     function drawWave() {
@@ -1284,25 +1384,30 @@
       ctx.globalCompositeOperation = "lighter";
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
-      traceWave(left, center, span, amplitude);
+      const path = traceWave(left, center, span, amplitude);
+      beginGlow();
+
+      // Wave points are soft-limited to ±1, so the trace stays in here.
+      const top = center - amplitude - 5;
+      const traceHeight = amplitude * 2 + 10;
 
       ctx.strokeStyle = waveGradient;
-      ctx.shadowColor = colors[7];
-      ctx.shadowBlur = 24;
       ctx.lineWidth = 9;
       ctx.globalAlpha = .12;
-      ctx.stroke();
+      ctx.stroke(path);
+      glowStroke(path, colors[7], .12, 9);
+      flushGlow(24, left - 5, top, span + 10, traceHeight);
 
-      ctx.shadowBlur = 12;
       ctx.lineWidth = 3;
       ctx.globalAlpha = .85;
-      ctx.stroke();
+      ctx.stroke(path);
+      glowStroke(path, colors[7], .85, 3);
+      flushGlow(12, left - 5, top, span + 10, traceHeight);
 
-      ctx.shadowBlur = 0;
       ctx.strokeStyle = "#f0fcff";
       ctx.lineWidth = 1;
       ctx.globalAlpha = .75;
-      ctx.stroke();
+      ctx.stroke(path);
       ctx.restore();
     }
 
@@ -1810,6 +1915,7 @@
     ctx.save();
     ctx.globalCompositeOperation = "lighter";
     ctx.lineWidth = 1.2;
+    beginGlow();
 
     for (const ripple of rhythm.ripples) {
       const progress = ripple.age / 1.6;
@@ -1821,16 +1927,17 @@
       const opacity = Math.pow(1 - progress, 2)
         * 0.28 * ripple.strength;
 
+      const path = new Path2D();
+      path.arc(cx, cy, radius, 0, TAU);
+
       ctx.globalAlpha = opacity;
       ctx.strokeStyle = ripple.color;
-      ctx.shadowColor = ripple.color;
-      ctx.shadowBlur = 12;
-
-      ctx.beginPath();
-      ctx.arc(cx, cy, radius, 0, TAU);
-      ctx.stroke();
+      ctx.stroke(path);
+      glowStroke(path, ripple.color, opacity, 1.2);
     }
 
+    const outer = baseRadius + size * 0.22 + 1;
+    flushGlow(12, cx - outer, cy - outer, outer * 2, outer * 2);
     ctx.restore();
   };
 
