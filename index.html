@@ -406,6 +406,11 @@
     const BAND_COUNT = 72;
     const COLOR_COUNT = 24;
     const WAVE_POINT_COUNT = 512;
+
+    // The fading trails were tuned on a machine drawing about 30 frames a
+    // second, and faster screens keep that look (see render). Raise this
+    // for a brighter, more washed-out picture.
+    const REFERENCE_FPS = 30;
     const reducedMotion = matchMedia("(prefers-reduced-motion: reduce)");
 
     let width = 1;
@@ -418,6 +423,11 @@
     let waveAutoGain = 1;
     let previousTime = 0;
     let clearNextFrame = true;
+
+    // Opacity multiplier for everything drawn this frame (see render).
+    let drawGain = 1;
+    let waveClock = 0;
+    let waveDue = true;
     let lastColorUpdate = -Infinity;
 
     const bands = new Float32Array(BAND_COUNT);
@@ -1068,19 +1078,37 @@
       const w = Math.max(1, Math.ceil(canvas.width / GLOW_DOWNSCALE));
       const h = Math.max(1, Math.ceil(canvas.height / GLOW_DOWNSCALE));
 
-      if (glowCanvas.width !== w || glowCanvas.height !== h) {
-        glowCanvas.width = blurCanvas.width = w;
-        glowCanvas.height = blurCanvas.height = h;
+      // Strokes are drawn at twice the blur layer's resolution and averaged
+      // down 2:1 when blurred. Drawn directly at 1/4, thin moving strokes
+      // made the glow crawl. Both sizes are checked: a fresh canvas is
+      // 300x150, which can coincide with the blur layer's target size.
+      if (
+        blurCanvas.width !== w || blurCanvas.height !== h ||
+        glowCanvas.width !== w * 2 || glowCanvas.height !== h * 2
+      ) {
+        blurCanvas.width = w;
+        blurCanvas.height = h;
+        glowCanvas.width = w * 2;
+        glowCanvas.height = h * 2;
       }
 
       // Drawing coordinates stay in CSS pixels, as in the scene canvas.
-      glowCtx.setTransform(w / width, 0, 0, h / height, 0, 0);
+      glowCtx.setTransform(w * 2 / width, 0, 0, h * 2 / height, 0, 0);
       glowCtx.globalCompositeOperation = "lighter";
       glowCtx.lineCap = "round";
       glowCtx.lineJoin = "round";
     }
 
     function glowStroke(path, color, alpha, lineWidth) {
+      // GPUs draw strokes thinner than a layer pixel unevenly (beaded
+      // rings). Widen them to one pixel, dimmed to keep the same light.
+      const minWidth = width / glowCanvas.width;
+
+      if (lineWidth < minWidth) {
+        alpha *= lineWidth / minWidth;
+        lineWidth = minWidth;
+      }
+
       glowCtx.strokeStyle = color;
       glowCtx.globalAlpha = alpha;
       glowCtx.lineWidth = lineWidth;
@@ -1090,20 +1118,20 @@
     // Blurs everything stroked since the last flush and adds it to the
     // scene. `blur` is the old shadowBlur value, in scene canvas pixels.
     // x, y, w, h bound the strokes in CSS pixels, so only that area is
-    // blurred and composited.
-    function flushGlow(blur, x, y, w, h) {
+    // blurred and composited. `gain` scales the glow's opacity.
+    function flushGlow(blur, x, y, w, h, gain = drawGain) {
       const sigma = blur / 2 / GLOW_DOWNSCALE;
       const pad = Math.ceil(sigma * 3) + 1;
-      const scaleX = glowCanvas.width / width;
-      const scaleY = glowCanvas.height / height;
+      const scaleX = blurCanvas.width / width;
+      const scaleY = blurCanvas.height / height;
 
       const left = Math.max(0, Math.floor(x * scaleX) - pad);
       const top = Math.max(0, Math.floor(y * scaleY) - pad);
       const right = Math.min(
-        glowCanvas.width, Math.ceil((x + w) * scaleX) + pad
+        blurCanvas.width, Math.ceil((x + w) * scaleX) + pad
       );
       const bottom = Math.min(
-        glowCanvas.height, Math.ceil((y + h) * scaleY) + pad
+        blurCanvas.height, Math.ceil((y + h) * scaleY) + pad
       );
 
       if (right > left && bottom > top) {
@@ -1111,15 +1139,17 @@
         const sh = bottom - top;
 
         // Clear all of it: scaling samples just past the copied area.
+        // The exact 2:1 downscale averages each 2x2 block of strokes.
         blurCtx.clearRect(0, 0, blurCanvas.width, blurCanvas.height);
         blurCtx.filter = `blur(${sigma}px)`;
         blurCtx.drawImage(
-          glowCanvas, left, top, sw, sh, left, top, sw, sh
+          glowCanvas, left * 2, top * 2, sw * 2, sh * 2,
+          left, top, sw, sh
         );
 
         ctx.save();
         ctx.globalCompositeOperation = "lighter";
-        ctx.globalAlpha = 1;
+        ctx.globalAlpha = gain;
         ctx.drawImage(
           blurCanvas, left, top, sw, sh,
           left / scaleX, top / scaleY, sw / scaleX, sh / scaleY
@@ -1149,8 +1179,8 @@
         const drift = reducedMotion.matches
           ? 0 : Math.sin(t * .15 + particle.phase) * 12;
 
-        ctx.globalAlpha =
-          .11 + (Math.sin(particle.phase + t * .35) + 1) * .07;
+        ctx.globalAlpha = drawGain *
+          (.11 + (Math.sin(particle.phase + t * .35) + 1) * .07);
 
         ctx.beginPath();
         ctx.arc(
@@ -1194,12 +1224,12 @@
 
         ctx.strokeStyle = colors[c];
         ctx.lineWidth = barWidth;
-        ctx.globalAlpha = .82;
+        ctx.globalAlpha = .82 * drawGain;
         ctx.stroke(path);
         glowStroke(path, colors[c], .82, barWidth);
 
         ctx.lineWidth = Math.max(1, barWidth * .3);
-        ctx.globalAlpha = .5;
+        ctx.globalAlpha = .5 * drawGain;
         ctx.stroke(path);
       }
 
@@ -1209,7 +1239,7 @@
         availableWidth, barWidth + tallest
       );
 
-      ctx.globalAlpha = .8;
+      ctx.globalAlpha = .8 * drawGain;
 
       for (let i = 0; i < BAND_COUNT; i++) {
         const x = left + (i + .5) * step;
@@ -1219,7 +1249,7 @@
         ctx.fillRect(x - barWidth / 2, y, barWidth, 2);
       }
 
-      ctx.globalAlpha = .1;
+      ctx.globalAlpha = .1 * drawGain;
       ctx.strokeStyle = colors[0];
       ctx.lineWidth = 1;
       ctx.beginPath();
@@ -1270,7 +1300,7 @@
         }
 
         ctx.strokeStyle = colors[c];
-        ctx.globalAlpha = .9;
+        ctx.globalAlpha = .9 * drawGain;
         ctx.stroke(path);
         glowStroke(path, colors[c], .9, lineWidth);
       }
@@ -1284,16 +1314,17 @@
 
       ctx.strokeStyle = colors[0];
       ctx.lineWidth = 1.5;
-      ctx.globalAlpha = .4 + bass * .5;
+      const ringAlpha = .4 + bass * .5;
+      ctx.globalAlpha = ringAlpha * drawGain;
       ctx.stroke(ring);
-      glowStroke(ring, colors[0], ctx.globalAlpha, 1.5);
+      glowStroke(ring, colors[0], ringAlpha, 1.5);
       flushGlow(
         20 + bass * 16,
         cx - ringRadius - 1, cy - ringRadius - 1,
         ringRadius * 2 + 2, ringRadius * 2 + 2
       );
 
-      ctx.globalAlpha = .13;
+      ctx.globalAlpha = .13 * drawGain;
       ctx.lineWidth = 1;
 
       ctx.beginPath();
@@ -1312,7 +1343,7 @@
       }
 
       ctx.fillStyle = coreGradient;
-      ctx.globalAlpha = .035 + bass * .13;
+      ctx.globalAlpha = (.035 + bass * .13) * drawGain;
       ctx.beginPath();
       ctx.arc(0, 0, 1, 0, TAU);
       ctx.fill();
@@ -1353,7 +1384,7 @@
 
       ctx.save();
       ctx.strokeStyle = "#8090b8";
-      ctx.globalAlpha = .055;
+      ctx.globalAlpha = .055 * drawGain;
       ctx.lineWidth = 1;
       ctx.beginPath();
 
@@ -1381,6 +1412,12 @@
         }
       }
 
+      // Snapshots are drawn at full strength, but only when one is due.
+      if (!waveDue) {
+        ctx.restore();
+        return;
+      }
+
       ctx.globalCompositeOperation = "lighter";
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
@@ -1396,13 +1433,13 @@
       ctx.globalAlpha = .12;
       ctx.stroke(path);
       glowStroke(path, colors[7], .12, 9);
-      flushGlow(24, left - 5, top, span + 10, traceHeight);
+      flushGlow(24, left - 5, top, span + 10, traceHeight, 1);
 
       ctx.lineWidth = 3;
       ctx.globalAlpha = .85;
       ctx.stroke(path);
       glowStroke(path, colors[7], .85, 3);
-      flushGlow(12, left - 5, top, span + 10, traceHeight);
+      flushGlow(12, left - 5, top, span + 10, traceHeight, 1);
 
       ctx.strokeStyle = "#f0fcff";
       ctx.lineWidth = 1;
@@ -1436,8 +1473,34 @@
       ctx.shadowBlur = 0;
 
       const fadeRate = mode === "wave" && !reducedMotion.matches ? 8 : 25;
-      ctx.globalAlpha = clearNextFrame
-        ? 1 : 1 - Math.exp(-fadeRate * dt);
+
+      // Rounded to the 8-bit alpha a software canvas applies, so the gain
+      // below matches the fade that really happens (GPUs differ by <1%).
+      const fade = Math.max(
+        1, Math.round(255 * (1 - Math.exp(-fadeRate * dt)))
+      ) / 255;
+      const referenceFade = Math.round(
+        255 * (1 - Math.exp(-fadeRate / REFERENCE_FPS))
+      ) / 255;
+
+      // Each frame adds light on top of the fading trail, so a fixed amount
+      // per frame made the picture brighter, whiter and smearier the higher
+      // the refresh rate. Scale it so every refresh rate settles where
+      // REFERENCE_FPS does. Slower frame rates keep full opacity.
+      drawGain = clearNextFrame ? 1 : Math.min(1, fade / referenceFade);
+
+      // A wave is a new snapshot every frame, so fast screens filled its
+      // trail with dozens of dim copies. Draw one at most REFERENCE_FPS
+      // times a second instead, at full strength.
+      const waveInterval = 1 / REFERENCE_FPS;
+      waveClock += dt;
+      waveDue = clearNextFrame || waveClock >= waveInterval;
+
+      if (waveDue) {
+        waveClock = Math.min(Math.max(0, waveClock - waveInterval), waveInterval);
+      }
+
+      ctx.globalAlpha = clearNextFrame ? 1 : fade;
 
       ctx.fillStyle = BG;
       ctx.fillRect(0, 0, width, height);
@@ -1930,7 +1993,7 @@
       const path = new Path2D();
       path.arc(cx, cy, radius, 0, TAU);
 
-      ctx.globalAlpha = opacity;
+      ctx.globalAlpha = opacity * drawGain;
       ctx.strokeStyle = ripple.color;
       ctx.stroke(path);
       glowStroke(path, ripple.color, opacity, 1.2);
