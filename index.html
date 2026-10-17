@@ -534,19 +534,42 @@
     // above its floor, so the bars rest near zero between songs and the
     // note being played stands out (see trackNoiseFloor).
     const NOISE = {
-      start: -90,     // dB when a source starts
-      warmRate: 40,   // dB/s the floor may climb during the first
-      warmTime: .5,   //   half second, to learn the room quickly
-      rise: 3,        // dB/s climb while a bar is near its floor
-      riseFar: .5,    // dB/s climb while far above it, so held notes stay
-      far: 8,         // dB above the floor that counts as "far"
-      fall: .5,       // s to follow the floor back down
-      ceiling: -55,   // dB; anything louder is never taken for noise
-      margin: 5,      // dB above the floor before a bar starts to lift
-      knee: 4         // dB of soft start, so quiet notes fade in
+      start: -90,       // dB per bar when a source starts
+      fall: .5,         // s to follow a bar's floor back down
+      learn: 15,        // dB/s a floor climbs while the room is quiet
+      ceiling: -55,     // dB; anything louder is never taken for noise
+      margin: 5,        // dB above the floor before a bar starts to lift
+      knee: 4,          // dB of soft start, so quiet notes fade in
+      quietStart: -55,  // dBFS guess of a quiet room, until one is heard
+      quiet: 4,         // dB above the quietest recent input still quiet
+      quietHold: .4,    // s it must stay quiet: a pause, not a beat's dip
+      quietRise: .25,   // dB/s the quietest-input reference may climb
+      steady: .6,       // dB the input may wander (averaged over half a
+      steadyHold: 1,    //   second) and still be steady, for this many
+                        //   seconds, with no more than
+      tones: 1          //   this many clear notes (a room-blurred chord
+                        //   still shows two or three)
     };
     const noiseFloor = new Float32Array(BAND_COUNT).fill(NOISE.start);
-    let noiseClock = 0;
+    let quietDb = NOISE.quietStart;
+    let quietTime = 0;
+    let levelMean = NaN;
+    let levelSpread = 0;
+    let steadyTime = 0;
+    let learningRoom = false;
+
+    // While music plays, a share of each bar's full spectrum (a note's
+    // spill, its harmonics, the room's echo) keeps it alive under the
+    // clean note level, so bars no longer drop to zero between notes.
+    // Silence still shows nothing: both count from the noise floor.
+    const PRESENCE = .55;
+
+    // Bars share part of their level with their neighbours, like beads on
+    // a string: a note lifts the bars beside it a little, and a bar alone
+    // among quiet ones is held below full height.
+    const SHARE = .5;
+    const SHARE_WEIGHTS = [0, 1, 2, 3].map(d => Math.exp(-d * d / 3.92));
+    const barLevels = new Float32Array(BAND_COUNT);
     const wavePoints = new Float32Array(WAVE_POINT_COUNT);
     const colors = new Array(COLOR_COUNT);
 
@@ -601,7 +624,12 @@
       waveAutoGain = 1;
       bass = 0;
       noiseFloor.fill(NOISE.start);
-      noiseClock = 0;
+      quietDb = NOISE.quietStart;
+      quietTime = 0;
+      levelMean = NaN;
+      levelSpread = 0;
+      steadyTime = 0;
+      learningRoom = false;
       clearNextFrame = true;
     }
 
@@ -849,7 +877,7 @@
 
       // Search a few bins past the outer bars (a tone's window reach),
       // clear of DC and Nyquist.
-      const first = Math.max(2, Math.floor(bandLow[0]) - 4);
+      const first = Math.max(1, Math.floor(bandLow[0]) - 4);
       const last = Math.min(
         count - 3, Math.ceil(bandHigh[BAND_COUNT - 1]) + 4
       );
@@ -1283,9 +1311,9 @@
       return Math.min(1, Math.pow(normalized, 0.9) * sensitivity);
     }
 
-    // Follows the quietest recent level of bar i: quickly down, slowly up,
-    // and very slowly while the bar is far above it (a held chord), so
-    // music is not mistaken for noise.
+    // Follows the quietest level of bar i: quickly down, and up only while
+    // the room is quiet (see readAudio), so music is never taken for
+    // noise.
     function trackNoiseFloor(i, db, dt, fallStep) {
       const level = Number.isFinite(db) ? Math.max(-100, db) : -100;
       const above = level - noiseFloor[i];
@@ -1293,10 +1321,8 @@
 
       if (above < 0) {
         floor += above * fallStep;
-      } else {
-        const rate = noiseClock < NOISE.warmTime ? NOISE.warmRate
-          : above < NOISE.far ? NOISE.rise : NOISE.riseFar;
-        floor += Math.min(above, rate * dt);
+      } else if (learningRoom) {
+        floor += Math.min(above, NOISE.learn * dt);
       }
 
       noiseFloor[i] = Math.min(floor, NOISE.ceiling);
@@ -1353,11 +1379,17 @@
 
     // Fills bandDb with the loudest sound per bar and bandRawDb with the
     // loudest bin per bar, both in dB, from one frame of spectrum data.
+    function blendDb(a, b, f) {
+      if (a > -Infinity && b > -Infinity) return a + (b - a) * f;
+      return f < .5 ? a : b;
+    }
+
     function analyseSpectrum(s, data) {
       const tones = s.tones;
       const { envelope, runnerUp, owner, residual } = tones;
       const { position, level, bin, first, last } = tones;
       let count = 0;
+      let clear = 0;
 
       for (let k = first; k <= last; k++) {
         envelope[k] = -Infinity;
@@ -1387,13 +1419,23 @@
 
         // A tone's own leakage explains the bins two away on both sides.
         if (
-          data[k - 2] > peak + leakAt(k - 2 - center) + TONE_SHAPE_MARGIN ||
+          (k >= 2 &&
+            data[k - 2] > peak + leakAt(k - 2 - center) + TONE_SHAPE_MARGIN) ||
           data[k + 2] > peak + leakAt(k + 2 - center) + TONE_SHAPE_MARGIN
         ) continue;
 
         position[count] = center;
         level[count] = peak;
         bin[count] = k;
+
+        // A clear note stands far above the spectrum around it; the
+        // random peaks of noise rarely do (see readAudio).
+        const top = data.length - 1;
+        const around = (
+          data[Math.max(0, k - 6)] + data[Math.max(0, k - 10)] +
+          data[Math.min(top, k + 6)] + data[Math.min(top, k + 10)]
+        ) / 4;
+        if (!(peak - around <= 15)) clear++;
 
         // Remember the strongest and second strongest leakage per bin.
         const reach = peak > -50 ? LEAK_REACH - 1 : peak > -70 ? 12 : 4;
@@ -1415,6 +1457,8 @@
         if (++count === position.length) break;
       }
 
+      tones.clear = clear;
+
       // 2. Bins that are not a tone's leakage keep their own level.
       for (let k = first; k <= last; k++) {
         residual[k] = data[k] > envelope[k] + LEAK_MARGIN
@@ -1430,10 +1474,12 @@
         let rawDb = -Infinity;
 
         if (lastBin < firstBin) {
-          // Narrower than a bin: use the nearest one.
-          const k = Math.round((low + high) / 2);
-          db = residual[k];
-          rawDb = data[k];
+          // Narrower than a bin: blend the two nearest, so neighbouring
+          // bass bars no longer move as identical blocks.
+          const centre = (low + high) / 2;
+          const k = Math.floor(centre);
+          db = blendDb(residual[k], residual[k + 1], centre - k);
+          rawDb = blendDb(data[k], data[k + 1], centre - k);
         } else {
           for (let k = firstBin; k <= lastBin; k++) {
             if (residual[k] > db) db = residual[k];
@@ -1550,35 +1596,96 @@
       let bassSum = 0;
       let bassPeak = 0;
 
-      if (active) noiseClock += dt;
+      // Only a microphone hears a room; digital silence (zeros from a
+      // device starting, a muted input) says nothing about it either.
+      const roomMic = active && s.kind === "mic";
+      const hearing = roomMic && s.silenceTime === 0;
+      learningRoom = false;
+
+      if (hearing) {
+        // While music played, the floors kept climbing into its steady
+        // body (6 dB in 9 s, up to 21 dB in the bass), so bars dropped to
+        // zero with the music still playing. The room is now learned only
+        // from what can only be noise: a pause (the input stays about as
+        // quiet as the quietest level heard for a moment, not the dip
+        // between two beats), or a steady sound without clear notes (a
+        // fan, hum, a loud room). Music pulses and a held chord has
+        // notes, so neither is learned, even if it was already playing
+        // when the microphone started.
+        const levelDb = 20 * Math.log10(Math.max(s.inputRms, 1e-8));
+        const below = levelDb - quietDb;
+        const follow = 1 - Math.exp(-dt / .5);
+
+        quietDb += below < 0
+          ? below * fallStep
+          : Math.min(below, NOISE.quietRise * dt);
+
+        quietTime = levelDb < quietDb + NOISE.quiet ? quietTime + dt : 0;
+
+        if (!Number.isFinite(levelMean)) levelMean = levelDb;
+        levelMean += (levelDb - levelMean) * follow;
+        levelSpread += (Math.abs(levelDb - levelMean) - levelSpread) * follow;
+
+        steadyTime = levelSpread < NOISE.steady && s.tones.clear <= NOISE.tones
+          ? steadyTime + dt : 0;
+
+        // A steady room becomes the new quiet reference.
+        if (steadyTime >= NOISE.steadyHold) quietDb = levelDb;
+
+        learningRoom = quietTime >= NOISE.quietHold ||
+          steadyTime >= NOISE.steadyHold;
+      }
 
       for (let i = 0; i < BAND_COUNT; i++) {
-        let target = 0;
+        let level = 0;
 
         if (active) {
           // The floor follows everything the bar hears, including a tone
           // that analyseSpectrum moved into it, but not the empty bars
           // beside a tone, whose noise is only hidden for a moment.
-          const floor = trackNoiseFloor(
-            i, Math.max(bandRawDb[i], bandDb[i]), dt, fallStep
-          );
+          const floor = !roomMic ? -Infinity
+            : !hearing ? noiseFloor[i]
+            : trackNoiseFloor(
+              i, Math.max(bandRawDb[i], bandDb[i]), dt, fallStep
+            );
+          const raw = spectrumLevel(bandRawDb[i], floor);
 
-          target = spectrumLevel(bandDb[i], floor);
+          level = Math.max(spectrumLevel(bandDb[i], floor), PRESENCE * raw);
 
           // The bass pulse keeps the full width of a kick or bass note.
           if (i >= s.bassBarStart && i <= s.bassBarEnd) {
-            const level = spectrumLevel(bandRawDb[i], floor);
-            bassSum += level;
-            bassPeak = Math.max(bassPeak, level);
+            bassSum += raw;
+            bassPeak = Math.max(bassPeak, raw);
           }
         } else if (preview) {
           const t = reducedMotion.matches ? 0 : time;
 
-          target = (
+          level = (
             .07 + .13 * Math.pow(Math.sin(i * .16 + t * .7), 2)
           ) * (
             .65 + .35 * Math.sin(i * .07 + 1)
           );
+        }
+
+        barLevels[i] = level;
+      }
+
+      for (let i = 0; i < BAND_COUNT; i++) {
+        let target = barLevels[i];
+
+        if (active) {
+          let sum = 0;
+          let weight = 0;
+
+          for (let d = 1 - SHARE_WEIGHTS.length; d < SHARE_WEIGHTS.length; d++) {
+            const j = i + d;
+            if (j < 0 || j >= BAND_COUNT) continue;
+
+            sum += SHARE_WEIGHTS[Math.abs(d)] * barLevels[j];
+            weight += SHARE_WEIGHTS[Math.abs(d)];
+          }
+
+          target = (1 - SHARE) * target + SHARE * sum / weight;
         }
 
         const response = target > bands[i] ? attack : release;
