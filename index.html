@@ -536,9 +536,9 @@
     const NOISE = {
       start: -90,       // dB per bar when a source starts
       fall: .5,         // s to follow a bar's floor back down
-      learn: 15,        // dB/s a floor climbs while the room is quiet
+      learn: 30,        // dB/s a floor climbs while the room is quiet
       ceiling: -55,     // dB; anything louder is never taken for noise
-      margin: 5,        // dB above the floor before a bar starts to lift
+      margin: 2,        // dB above the floor before a bar starts to lift
       knee: 4,          // dB of soft start, so quiet notes fade in
       quietStart: -55,  // dBFS guess of a quiet room, until one is heard
       quiet: 4,         // dB above the quietest recent input still quiet
@@ -1306,9 +1306,10 @@
 
       const normalized = Math.min(1, excess / Math.max(30, -20 - bottom));
 
-      // A gentle lift makes quiet spectral detail easier to see.
-      // True zero stays zero; no invented live frequency activity.
-      return Math.min(1, Math.pow(normalized, 0.9) * sensitivity);
+      // A lift makes quiet spectral detail easier to see, so music heard
+      // across a room fills the bars instead of leaving gaps between
+      // notes. True zero stays zero; no invented frequency activity.
+      return Math.min(1, Math.pow(normalized, 0.7) * sensitivity);
     }
 
     // Follows the quietest level of bar i: quickly down, and up only while
@@ -1623,14 +1624,20 @@
         quietTime = levelDb < quietDb + NOISE.quiet ? quietTime + dt : 0;
 
         if (!Number.isFinite(levelMean)) levelMean = levelDb;
+        const jump = Math.abs(levelDb - levelMean);
         levelMean += (levelDb - levelMean) * follow;
-        levelSpread += (Math.abs(levelDb - levelMean) - levelSpread) * follow;
 
-        steadyTime = levelSpread < NOISE.steady && s.tones.clear <= NOISE.tones
-          ? steadyTime + dt : 0;
+        // One jump (the input starting) counts at most 3 dB, so it cannot
+        // hide a steady room for seconds; music keeps wandering anyway.
+        levelSpread += (Math.min(3, jump) - levelSpread) * follow;
+
+        // A jump (music starting) ends a steady stretch at once, before
+        // the averages catch up with it.
+        steadyTime = levelSpread < NOISE.steady && jump < 2 * NOISE.steady &&
+          s.tones.clear <= NOISE.tones ? steadyTime + dt : 0;
 
         // A steady room becomes the new quiet reference.
-        if (steadyTime >= NOISE.steadyHold) quietDb = levelDb;
+        if (steadyTime >= NOISE.steadyHold) quietDb = levelMean;
 
         learningRoom = quietTime >= NOISE.quietHold ||
           steadyTime >= NOISE.steadyHold;
